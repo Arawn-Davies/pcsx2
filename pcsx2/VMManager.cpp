@@ -41,6 +41,7 @@
 #include "USB/USB.h"
 #include "Vif_Dynarec.h"
 #include "VMManager.h"
+#include "PS2Linux.h"
 #include "ps2/BiosTools.h"
 
 #include "common/Console.h"

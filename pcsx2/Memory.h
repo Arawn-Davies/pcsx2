@@ -163,7 +163,17 @@ namespace SysMemory
 extern void memSetKernelMode();
 //extern void memSetSupervisorMode();
 extern void memSetUserMode();
+extern void memSetPageAddrReadOnly(u32 vaddr);
 extern void memSetPageAddr(u32 vaddr, u32 paddr);
+
+// kuseg is TLB-mapped except while Status.ERL = 1, when it is direct-mapped to
+// physical memory (EE Core User's Manual Fig. 5-1, note 3).
+//
+// Cheap to call on every ERL transition: it tracks what is installed and does
+// nothing when the request matches, so callers need no state of their own.
+// Returns true only when the mapping actually changed, which is the caller's
+// cue that anything layered on kuseg has been cleared and needs reinstating.
+extern bool memApplyKuseg(bool erlDirect);
 extern void memClearPageAddr(u32 vaddr);
 extern void memBindConditionalHandlers();
 extern bool memGetExtraMemMode();

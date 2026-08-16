@@ -175,7 +175,7 @@ public:
 	int WriteDMAFromFIFO(u8* buffer, int available);
 
 	u16 ATAreadPIO();
-	//ATAwritePIO;
+	void ATAwritePIO(u16 value);
 
 private:
 	void InitSparseSupport(const std::string& hddPath);
@@ -258,6 +258,8 @@ private:
 
 	void DRQCmdPIODataToHost(u8* buff, int buffLen, int buffIndex, int size, bool sendIRQ);
 	void PostCmdPIODataToHost();
+	void DRQCmdPIODataFromHost(bool sendIRQ);
+	void PostCmdPIODataFromHost();
 	void HDD_IdentifyDevice();
 
 	void HDD_ReadMultiple(bool isLBA48);
@@ -265,7 +267,9 @@ private:
 	void HDD_ReadPIO(bool isLBA48);
 	void HDD_ReadPIOS2();
 	void HDD_ReadPIOEndBlock();
-	//HDD_Write*
+	void HDD_WriteSectors(bool isLBA48);
+	void HDD_WriteMultiple(bool isLBA48);
+	void HDD_WritePIO(bool isLBA48);
 
 	void HDD_Smart();
 	void SMART_SetAutoSaveAttribute();

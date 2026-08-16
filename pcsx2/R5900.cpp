@@ -6,6 +6,7 @@
 #include "common/StringUtil.h"
 #include "ps2/BiosTools.h"
 #include "R5900.h"
+#include "PS2Linux.h"
 #include "R3000A.h"
 #include "ps2/pgif.h" // pgif init
 #include "VUmicro.h"
@@ -26,6 +27,7 @@
 #include "DebugTools/MIPSAnalyst.h"
 #include "DebugTools/SymbolGuardian.h"
 #include "R5900OpcodeTables.h"
+#include "DebugTools/Debug.h"
 
 #include "fmt/format.h"
 
@@ -66,6 +68,7 @@ void cpuReset()
 	cpuRegs.pc				= 0xbfc00000; //set pc reg to stack
 	cpuRegs.CP0.n.Config	= 0x440;
 	cpuRegs.CP0.n.Status.val= 0x70400004; //0x10900000 <-- wrong; // COP0 enabled | BEV = 1 | TS = 1
+	cpuRegs.CP0.n.Random	= 47;   // top TLB index; counts down towards Wired
 	cpuRegs.CP0.n.PRid		= 0x00002e20; // PRevID = Revision ID, same as R5900
 	fpuRegs.fprc[0]			= 0x00002e30; // fpu Revision..
 	fpuRegs.fprc[31]		= 0x01000001; // fpu Status/Control
@@ -91,12 +94,76 @@ void cpuReset()
 	CBreakPoints::ClearSkipFirst();
 }
 
+bool eeTlbInvalidMatch = false;   // set by cpuTlbMiss, consumed here
+
+// Every exception except the timer interrupt, so the run-up to a userspace
+// fault can be read off directly instead of inferred. TLB misses are the
+// normal case and would drown everything else, so they are counted rather
+// than printed unless they are at an address that keeps repeating.
+static int eeExcBudget = 300;
+
+// Guest syscall trace -- an strace for something we cannot rebuild.
+//
+// Linux userspace enters the kernel with the syscall instruction, which shows
+// up here as excode 8 with the call number in v0. MIPS Linux numbers start at
+// 4000, which conveniently separates them from the PS2 BIOS syscalls that use
+// this same exception and would otherwise drown the log.
+//
+// Bounded: bash issues thousands, and the interesting part is the first few
+// hundred, up to wherever it goes wrong.
+static int eeSyscallBudget = 400;
+
+// The last few user-space faults, so an exception carries its own run-up
+// instead of needing to be correlated against a separate trace by hand.
+static u32 eeRecentUserFault[8];
+static u32 eeRecentUserFaultPC[8];
+static int eeRecentUserFaultAt = 0;
+
 __ri void cpuException(u32 code, u32 bd)
 {
 	bool errLevel2, checkStatus;
 	u32 offset = 0;
 
     cpuRegs.branch = 0;		// Tells the interpreter that an exception occurred during a branch.
+	const bool tlbInvalid = eeTlbInvalidMatch;
+	eeTlbInvalidMatch = false;
+
+	{
+		const u32 excode = (code >> 2) & 0x1f;
+
+		if (excode == 8 && eeSyscallBudget > 0)
+		{
+			const u32 nr = cpuRegs.GPR.n.v0.UL[0];
+			if (nr >= 4000 && nr < 5000)
+			{
+				eeSyscallBudget--;
+				Console.WriteLn("  SYS %4u a0=%08x a1=%08x a2=%08x pc=%08x asid=%02x",
+					nr - 4000, cpuRegs.GPR.n.a0.UL[0], cpuRegs.GPR.n.a1.UL[0],
+					cpuRegs.GPR.n.a2.UL[0], cpuRegs.pc,
+					cpuRegs.CP0.n.EntryHi & 0xff);
+			}
+		}
+
+		// 0 = interrupt, 2/3 = the TLB misses that are the normal path,
+		// 8 = syscall, which the BIOS issues constantly.
+		if (excode != 0 && excode != 2 && excode != 3 && excode != 8 && eeExcBudget > 0)
+		{
+			eeExcBudget--;
+			Console.WriteLn("  EXC %u pc=%08x epc=%08x badv=%08x asid=%02x sr=%08x",
+				excode, cpuRegs.pc, cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.BadVAddr,
+				cpuRegs.CP0.n.EntryHi & 0xff, cpuRegs.CP0.n.Status.val);
+
+			std::string recent;
+			for (int i = 0; i < 8; i++)
+			{
+				const int at = (eeRecentUserFaultAt + i) & 7;
+				if (eeRecentUserFault[at])
+					recent += StringUtil::StdStringFromFormat("%08x@%08x ",
+						eeRecentUserFault[at], eeRecentUserFaultPC[at]);
+			}
+			Console.WriteLn("      recent user faults: %s", recent.c_str());
+		}
+	}
 	cpuRegs.CP0.n.Cause = code & 0xffff;
 
 	if(cpuRegs.CP0.n.Status.b.ERL == 0)
@@ -106,7 +173,7 @@ __ri void cpuException(u32 code, u32 bd)
 		checkStatus = (cpuRegs.CP0.n.Status.b.BEV == 0); //  for TLB/general exceptions
 
 		if (((code & 0x7C) >= 0x8) && ((code & 0x7C) <= 0xC))
-			offset = 0x0; //TLB Refill
+			offset = tlbInvalid ? 0x180 : 0x0; // TLB Invalid vs Refill
 		else if ((code & 0x7C) == 0x0)
 			offset = 0x200; //Interrupt
 		else
@@ -140,7 +207,11 @@ __ri void cpuException(u32 code, u32 bd)
 		cpuRegs.CP0.n.Status.b.EXL = 1;
 		if (bd)
 		{
-			Console.Warning("branch delay!!");
+			// Rate-limited: an exception in a delay slot is rare for games but
+			// routine for a demand-paged OS, where it floods the log.
+			static int s_bdSpamStop = 0;
+			if (s_bdSpamStop++ < 50 || IsDevBuild)
+				Console.Warning("branch delay!! (%d)", s_bdSpamStop);
 			cpuRegs.CP0.n.EPC = cpuRegs.pc - 4;
 			cpuRegs.CP0.n.Cause |= 0x80000000;
 		}
@@ -164,12 +235,256 @@ __ri void cpuException(u32 code, u32 bd)
 	cpuUpdateOperationMode();
 }
 
+// ---- kernelreloaded instrumentation ---------------------------------------
+// PS2 Linux writes its console to the GS framebuffer, so once the kernel is
+// running nothing it says reaches this log. When it stops there is no way from
+// the outside to tell a livelock from a halt from a spin inside a driver.
+//
+// This prints the whole EE state roughly once a second: pc with disassembly,
+// every GPR, the CP0 control registers with the exception cause decoded, the
+// stack, and all 48 TLB entries.
+//
+// It translates addresses itself rather than going through the vtlb, for two
+// reasons: a dump must never fault or recurse into the exception path it is
+// trying to describe, and going through the vtlb would show the mapping PCSX2
+// thinks it has rather than the one the guest's TLB actually describes -- the
+// difference between the two being exactly what is under suspicion.
+static u32 eeTlbMissCount = 0;
+static u32 eeTlbMissLast = 0;
+static u32 eeTlbMissPrev = 0;
+static u32 eeLastDump = 0;
+
+
+// Bounded because the failure runs at ~10M faults a second: enough events to
+// replay the sequence by hand, then silence.
+int eeTraceBudget = 400;
+
+static const char* eeSeg(u32 a)
+{
+	if (a >= 0xE0000000) return "kseg3";
+	if (a >= 0xC0000000) return "kseg2";
+	if (a >= 0xA0000000) return "kseg1";
+	if (a >= 0x80000000) return "kseg0";
+	return "useg";
+}
+
+// Walk the guest TLB by hand. Returns false when the address is genuinely
+// unmapped -- which is the interesting answer, not an error.
+static bool eeTranslate(u32 va, u32* pa)
+{
+	if (va >= 0x80000000 && va < 0xC0000000)
+	{
+		*pa = va & 0x1FFFFFFF;
+		return true;
+	}
+
+	for (int i = 0; i < 48; i++)
+	{
+		const u32 pageSize = (tlb[i].Mask() + 1) << 12;
+		const u32 base = tlb[i].VPN2();
+
+		if (va < base || va >= base + pageSize * 2)
+			continue;
+		if (!tlb[i].isGlobal() && (tlb[i].EntryHi.ASID != (cpuRegs.CP0.n.EntryHi & 0xff)))
+			continue;
+
+		const bool odd = (va - base) >= pageSize;
+		const EntryLo_t& lo = odd ? tlb[i].EntryLo1 : tlb[i].EntryLo0;
+		if (!lo.V)
+			return false;
+
+		*pa = (odd ? tlb[i].PFN1() : tlb[i].PFN0()) + ((va - base) & (pageSize - 1));
+		return true;
+	}
+	return false;
+}
+
+// MIPS raises two different exceptions for a failed translation, and they do
+// NOT share a vector:
+//
+//   no entry matches the address        -> TLB Refill,  vector 0x000
+//   an entry matches but has V=0        -> TLB Invalid, vector 0x180
+//
+// PCSX2 only ever knew "mapped or not" -- MapTLB skips V=0 entries entirely --
+// so it sent both to 0x000. That breaks demand paging, which is built on the
+// difference: the refill handler installs the (invalid) PTE it finds, and the
+// retry is meant to trap to 0x180 and reach do_page_fault, which allocates the
+// page. Sent back to 0x000 instead, the handler reinstalls the same zero PTE
+// forever. Games never notice because they map everything up front and never
+// demand-page.
+static bool eeTlbMatches(u32 va)
+{
+	for (int i = 0; i < 48; i++)
+	{
+		const u32 pageSize = (tlb[i].Mask() + 1) << 12;
+		const u32 base = tlb[i].VPN2();
+
+		if (va < base || va >= base + pageSize * 2)
+			continue;
+		if (!tlb[i].isGlobal() && (tlb[i].EntryHi.ASID != (cpuRegs.CP0.n.EntryHi & 0xff)))
+			continue;
+
+		// A matching entry that were valid would not have missed, so reaching
+		// here means it matched and was invalid.
+		return true;
+	}
+	return false;
+}
+
+static bool eeRead32(u32 va, u32* out)
+{
+	u32 pa;
+	if (!eeTranslate(va, &pa))
+		return false;
+	if (!eeMem || pa + 4 > Ps2MemSize::ExposedRam)
+		return false;
+	*out = *reinterpret_cast<u32*>(&eeMem->Main[pa]);
+	return true;
+}
+
+static const char* eeExcName(u32 code)
+{
+	switch (code)
+	{
+		case 0:  return "Int";
+		case 1:  return "TLBMod";
+		case 2:  return "TLBL";
+		case 3:  return "TLBS";
+		case 4:  return "AdEL";
+		case 5:  return "AdES";
+		case 6:  return "IBE";
+		case 7:  return "DBE";
+		case 8:  return "Sys";
+		case 9:  return "Bp";
+		case 10: return "RI";
+		case 11: return "CpU";
+		case 12: return "Ov";
+		case 13: return "Tr";
+		default: return "?";
+	}
+}
+
+static void cpuStateDump()
+{
+	// cpuRegs.cycle is declared u64 but wraps at 32 bits in practice, so a
+	// "next due" absolute deadline past 2^32 is never reached and the dump
+	// stops for good. Compare a 32-bit delta instead, which wraps with it.
+	static const u32 interval = 1500 * 1000 * 1000;
+
+	if (static_cast<u32>(static_cast<u32>(cpuRegs.cycle) - eeLastDump) < interval)
+		return;
+	eeLastDump = static_cast<u32>(cpuRegs.cycle);
+
+	const u32 pc = cpuRegs.pc;
+	const u32 sp = cpuRegs.GPR.r[29].UL[0];
+	const u32 exc = (cpuRegs.CP0.n.Cause >> 2) & 0x1f;
+
+	Console.WriteLn("======== EE state @ cycle %llu ========", cpuRegs.cycle);
+	Console.WriteLn("pc   =%08x (%s)   sp=%08x (%s)   ra=%08x",
+		pc, eeSeg(pc), sp, eeSeg(sp), cpuRegs.GPR.r[31].UL[0]);
+
+	// Instructions at pc, so a spin loop is identifiable on sight.
+	for (int i = 0; i < 6; i++)
+	{
+		u32 word;
+		if (!eeRead32(pc + i * 4, &word))
+		{
+			Console.WriteLn("  %08x: <unmapped>", pc + i * 4);
+			continue;
+		}
+		std::string text;
+		R5900::disR5900Fasm(text, word, pc + i * 4, false);
+		Console.WriteLn("  %08x: %08x  %s", pc + i * 4, word, text.c_str());
+	}
+
+	Console.WriteLn("sr   =%08x  cause=%08x exc=%u(%s)  epc=%08x  errepc=%08x",
+		cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause, exc, eeExcName(exc),
+		cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.ErrorEPC);
+	Console.WriteLn("badv =%08x  entryhi=%08x (asid=%02x)  index=%08x random=%u wired=%u",
+		cpuRegs.CP0.n.BadVAddr, cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.EntryHi & 0xff,
+		cpuRegs.CP0.n.Index, cpuRegs.CP0.n.Random, cpuRegs.CP0.n.Wired);
+	Console.WriteLn("lo0  =%08x  lo1=%08x  pagemask=%08x  context=%08x  count=%08x compare=%08x",
+		cpuRegs.CP0.n.EntryLo0, cpuRegs.CP0.n.EntryLo1, cpuRegs.CP0.n.PageMask,
+		cpuRegs.CP0.n.Context, cpuRegs.CP0.n.Count, cpuRegs.CP0.n.Compare);
+	Console.WriteLn("tlb misses since last dump: %u  last=%08x prev=%08x",
+		eeTlbMissCount, eeTlbMissLast, eeTlbMissPrev);
+
+	for (int i = 0; i < 32; i += 4)
+	{
+		Console.WriteLn("  %-4s=%08x %-4s=%08x %-4s=%08x %-4s=%08x",
+			R5900::GPR_REG[i + 0], cpuRegs.GPR.r[i + 0].UL[0],
+			R5900::GPR_REG[i + 1], cpuRegs.GPR.r[i + 1].UL[0],
+			R5900::GPR_REG[i + 2], cpuRegs.GPR.r[i + 2].UL[0],
+			R5900::GPR_REG[i + 3], cpuRegs.GPR.r[i + 3].UL[0]);
+	}
+
+	std::string line;
+	for (int i = 0; i < 8; i++)
+	{
+		u32 word;
+		line += StringUtil::StdStringFromFormat(
+			eeRead32(sp + i * 4, &word) ? "%08x " : "-------- ", word);
+	}
+	Console.WriteLn("stack@sp: %s", line.c_str());
+
+	int valid = 0;
+	for (int i = 0; i < 48; i++)
+	{
+		if (!tlb[i].EntryLo0.V && !tlb[i].EntryLo1.V)
+			continue;
+		valid++;
+		Console.WriteLn("  tlb[%2d] vpn2=%08x size=%6uk pfn0=%08x%s pfn1=%08x%s asid=%02x%s",
+			i, tlb[i].VPN2(), ((tlb[i].Mask() + 1) << 12) / 1024,
+			tlb[i].PFN0(), tlb[i].EntryLo0.V ? "" : "(inv)",
+			tlb[i].PFN1(), tlb[i].EntryLo1.V ? "" : "(inv)",
+			tlb[i].EntryHi.ASID, tlb[i].isGlobal() ? " G" : "");
+	}
+	Console.WriteLn("tlb entries in use: %d/48", valid);
+
+	eeTlbMissCount = 0;
+}
+
 void cpuTlbMiss(u32 addr, u32 bd, u32 excode)
 {
+	eeTlbMissCount++;
+	eeTlbMissPrev = eeTlbMissLast;
+	eeTlbMissLast = addr;
+
+	// Must be decided before EntryHi is rewritten below, since the ASID in it
+	// is what the match is against.
+	eeTlbInvalidMatch = eeTlbMatches(addr);
+
+	if (addr < 0x80000000)
+	{
+		eeRecentUserFault[eeRecentUserFaultAt] = addr;
+		eeRecentUserFaultPC[eeRecentUserFaultAt] = cpuRegs.pc;
+		eeRecentUserFaultAt = (eeRecentUserFaultAt + 1) & 7;
+	}
+
+	if (eeTraceBudget > 0)
+	{
+		eeTraceBudget--;
+		Console.WriteLn("  TLBMISS addr=%08x epc/pc=%08x exc=%u hi=%08x ctx=%08x",
+			addr, cpuRegs.pc, excode, cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.Context);
+	}
+
 	// Avoid too much spamming on the interpreter
 	if (Cpu != &intCpu || IsDebugBuild) {
 		Console.Error("cpuTlbMiss pc:%x, cycl:%x, addr: %x, status=%x, code=%x",
 				cpuRegs.pc, cpuRegs.cycle, addr, cpuRegs.CP0.n.Status.val, excode);
+	}
+
+	// A fault on a near-null address is never legitimate here, and it is the
+	// signature of the bash crash: exccode 3 (TLB store) reported at a pc
+	// whose instruction is a syscall, which performs no store. Log it in full
+	// regardless of the trace budget -- it is rare, so it cannot spam.
+	if (addr < 0x10000)
+	{
+		Console.Error("  NEARNULL addr=%08x pc=%08x excode=%u branch=%u opcode=%08x "
+			"delayop=%08x epc=%08x cause=%08x",
+			addr, cpuRegs.pc, excode, (u32)cpuRegs.branch, cpuRegs.code,
+			cpuRegs.branch ? 1u : 0u,
+			cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.Cause);
 	}
 
 	cpuRegs.CP0.n.BadVAddr = addr;
@@ -179,6 +494,12 @@ void cpuTlbMiss(u32 addr, u32 bd, u32 excode)
 
 	cpuRegs.pc -= 4;
 	cpuException(excode, bd);
+}
+
+// Store to a page whose EntryLo.D is clear. Vectors to 0x180 like any other
+// non-refill exception, which cpuException already does for this code.
+void cpuTlbModified(u32 addr, u32 bd) {
+	cpuTlbMiss(addr, bd, EXC_CODE(1));
 }
 
 void cpuTlbMissR(u32 addr, u32 bd) {
@@ -361,6 +682,7 @@ static bool cpuIntsEnabled(int Interrupt)
 __fi void _cpuEventTest_Shared()
 {
 	eeEventTestIsActive = true;
+	cpuStateDump();
 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
 	cpuRegs.lastEventCycle = cpuRegs.cycle;
 	// ---- INTC / DMAC (CPU-level Exceptions) -----------------
@@ -600,6 +922,28 @@ int ParseArgumentString(u32 arg_block)
 // Called from recompilers; define is mandatory.
 void eeloadHook()
 {
+	// PS2 Linux direct boot.
+	//
+	// Taken here rather than straight after cpuReset() because the SBIOS
+	// needs the IOP's published SIF RPC address, which only exists once the
+	// BIOS has booted and brought the IOP up. By the time EELOAD is called
+	// that has happened, and nothing of what EELOAD would have launched is
+	// wanted -- DirectBoot() sets pc to the kernel entry, so returning here
+	// redirects execution into it.
+	if (PS2Linux::IsDirectBootRequested())
+	{
+		static bool s_direct_boot_done = false;
+		if (!s_direct_boot_done)
+		{
+			s_direct_boot_done = true;
+			std::string db_error;
+			if (PS2Linux::DirectBoot(PS2Linux::GetRequestedBootParams(), &db_error))
+				return;
+
+			Console.Error(fmt::format("PS2 Linux direct boot failed: {}", db_error));
+		}
+	}
+
 	std::string elfname;
 	int argc = cpuRegs.GPR.n.a0.SD[0];
 	if (argc) // calls to EELOAD *after* the first one during the startup process will come here

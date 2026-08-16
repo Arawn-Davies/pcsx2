@@ -218,16 +218,21 @@ void LogWindow::createUi()
 	m_input_hbox->addWidget(m_newline_on_enter_checkbox);
 	m_input_hbox->setSpacing(8);
 
+	// The Linux branch set no point size at all, so the log came out at
+	// whatever the platform default was -- unreadably small under WSLg.
+	// Ctrl+scroll still zooms, but that is per-session; this is the default.
 #if defined(_WIN32)
+	const int default_font_size = 10;
 	QFont font("Consolas");
-	font.setPointSize(10);
 #elif defined(__APPLE__)
+	const int default_font_size = 11;
 	QFont font("Monaco");
-	font.setPointSize(11);
 #else
+	const int default_font_size = 12;
 	QFont font("Monospace");
 	font.setStyleHint(QFont::TypeWriter);
 #endif
+	font.setPointSize(Host::GetBaseIntSettingValue("UI", "LogWindowFontSize", default_font_size));
 	m_text->setFont(font);
 
 	QWidget* central_widget = new QWidget(this);

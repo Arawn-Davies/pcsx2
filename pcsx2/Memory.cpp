@@ -23,6 +23,7 @@ BIOS
 */
 
 #include "DEV9/DEV9.h"
+#include <cstdlib>
 #include "IopHw.h"
 #include "GS/Renderers/Common/GSFunctionMap.h"
 #include "GS.h"
@@ -41,6 +42,12 @@ BIOS
 #ifdef ENABLECACHE
 #include "Cache.h"
 #endif
+
+// EE-side DEV9 accesses are logged one line per access below. Games never reach
+// DEV9 from the EE, so this is normally silent -- but PS2 Linux drives the ATA
+// PIO data register from the EE, 256 words per sector, which floods the log and
+// dominates run time. Off by default; set PCSX2_DEV9_TRACE=1 to get it back.
+static const bool s_dev9Trace = (std::getenv("PCSX2_DEV9_TRACE") != nullptr);
 
 namespace Ps2MemSize
 {
@@ -589,7 +596,8 @@ static mem8_t _ext_memRead8 (u32 mem)
 		case 7: // dev9
 		{
 			mem8_t retval = DEV9read8(mem & ~0xa4000000);
-			Console.WriteLn("DEV9 read8 %8.8lx: %2.2lx", mem & ~0xa4000000, retval);
+			if (s_dev9Trace)
+				Console.WriteLn("DEV9 read8 %8.8lx: %2.2lx", mem & ~0xa4000000, retval);
 			return retval;
 		}
 		case 9:
@@ -619,7 +627,8 @@ static mem16_t _ext_memRead16(u32 mem)
 		case 7: // dev9
 		{
 			mem16_t retval = DEV9read16(mem & ~0xa4000000);
-			Console.WriteLn("DEV9 read16 %8.8lx: %4.4lx", mem & ~0xa4000000, retval);
+			if (s_dev9Trace)
+				Console.WriteLn("DEV9 read16 %8.8lx: %4.4lx", mem & ~0xa4000000, retval);
 			return retval;
 		}
 
@@ -645,7 +654,8 @@ static mem32_t _ext_memRead32(u32 mem)
 		case 7: // dev9
 		{
 			mem32_t retval = DEV9read32(mem & ~0xa4000000);
-			Console.WriteLn("DEV9 read32 %8.8lx: %8.8lx", mem & ~0xa4000000, retval);
+			if (s_dev9Trace)
+				Console.WriteLn("DEV9 read32 %8.8lx: %8.8lx", mem & ~0xa4000000, retval);
 			return retval;
 		}
 		case 9:
@@ -716,7 +726,8 @@ static void _ext_memWrite8 (u32 mem, mem8_t  value)
 			gsWrite8(mem, value); return;
 		case 7: // dev9
 			DEV9write8(mem & ~0xa4000000, value);
-			Console.WriteLn("DEV9 write8 %8.8lx: %2.2lx", mem & ~0xa4000000, value);
+			if (s_dev9Trace)
+				Console.WriteLn("DEV9 write8 %8.8lx: %2.2lx", mem & ~0xa4000000, value);
 			return;
 		case 9:
 			iopMemWrite8(mem & ~0x1c000000, value);
@@ -740,7 +751,8 @@ static void _ext_memWrite16(u32 mem, mem16_t value)
 			gsWrite16(mem, value); return;
 		case 7: // dev9
 			DEV9write16(mem & ~0xa4000000, value);
-			Console.WriteLn("DEV9 write16 %8.8lx: %4.4lx", mem & ~0xa4000000, value);
+			if (s_dev9Trace)
+				Console.WriteLn("DEV9 write16 %8.8lx: %4.4lx", mem & ~0xa4000000, value);
 			return;
 		case 8: // spu2
 			SPU2write(mem, value); return;
@@ -761,7 +773,8 @@ static void _ext_memWrite32(u32 mem, mem32_t value)
 			gsWrite32(mem, value); return;
 		case 7: // dev9
 			DEV9write32(mem & ~0xa4000000, value);
-			Console.WriteLn("DEV9 write32 %8.8lx: %8.8lx", mem & ~0xa4000000, value);
+			if (s_dev9Trace)
+				Console.WriteLn("DEV9 write32 %8.8lx: %8.8lx", mem & ~0xa4000000, value);
 			return;
 		case 9:
 			iopMemWrite32(mem & ~0x1c000000, value);
@@ -1036,6 +1049,11 @@ void memSetPageAddr(u32 vaddr, u32 paddr)
 
 }
 
+void memSetPageAddrReadOnly(u32 vaddr)
+{
+	vtlb_VMapWriteProtected(vaddr, 0x1000);
+}
+
 void memClearPageAddr(u32 vaddr)
 {
 	//Console.WriteLn("memClearPageAddr: %8.8x", vaddr);
@@ -1090,6 +1108,60 @@ void memBindConditionalHandlers()
 void memAllocate()
 {
 	eeMem = reinterpret_cast<EEVM_MemoryAllocMess*>(SysMemory::GetEEMem());
+}
+
+// Which kuseg mapping is installed. Owned here rather than by the caller so it
+// cannot drift out of step with the vtlb across a VM reset.
+//
+// Initialised true because the processor comes up in error level: EE Core
+// User's Manual Status register table gives ERL, bit 2, Initial Value 1. So
+// kuseg is direct-mapped from reset until the BIOS clears ERL.
+static bool s_kusegDirect = true;
+
+bool memApplyKuseg(bool erlDirect)
+{
+	// EE Core User's Manual Figure 5-1 lists kuseg as "Mapped", with note 3:
+	// "The Kernel mode user space, or kuseg, is unmapped when Status.ERL=1
+	// (when the level 2 exception handler is executing)."
+	//
+	// "Unmapped" is the MIPS sense -- the physical address is taken from the
+	// virtual address directly, as kseg0 and kseg1 do (Fig. 5-1 note 1). The
+	// physical space those segments reach is 0x00000000-0x1FFFFFFF, so that is
+	// the extent that resolves under ERL; the remainder of the 2GB has no
+	// physical address behind it and stays unmapped.
+	//
+	// OPEN, and deliberately not implemented here: R4000 p3754 adds that the
+	// ERL user region is *uncached* as well as unmapped. The EE Core manual
+	// says only "unmapped" and does not mention cacheability either way, and
+	// the EE Core manual is the authority for this part. Modelling the cache
+	// bypass is a separate change and wants confirmation from hardware or from
+	// a Sony source that states it, not an inference from R4000.
+	//
+	// ALSO OPEN: R4000 p3754 gives the ERL user region as the full 2^31 bytes.
+	// Only the low 512MB is direct-mapped below, because that is the whole of
+	// the physical space kseg0/kseg1 reach (Fig. 5-1 note 1) and there is
+	// nothing behind the rest. The consequence is that 0x20000000-0x7FFFFFFF
+	// raises a TLB refill under ERL when translation is supposed to be bypassed
+	// entirely. No guest is known to go there; it is wrong all the same.
+	//
+	// Returns true when the mapping actually changed, so the caller knows
+	// whether it has to reinstate anything.
+	if (erlDirect == s_kusegDirect)
+		return false;
+
+	s_kusegDirect = erlDirect;
+
+	if (erlDirect)
+	{
+		vtlb_VMap(0x00000000, 0x00000000, 0x20000000);
+		vtlb_VMapUnmap(0x20000000, 0x60000000);
+	}
+	else
+	{
+		vtlb_VMapUnmap(0x00000000, 0x80000000);
+	}
+
+	return true;
 }
 
 void memReset()
@@ -1207,8 +1279,30 @@ void memReset()
 	memMapUserMem();
 	memSetKernelMode();
 
-	vtlb_VMap(0x00000000,0x00000000,0x20000000);
-	vtlb_VMapUnmap(0x20000000,0x60000000);
+	// kuseg (0x00000000-0x7FFFFFFF) is TLB-mapped -- EE Core User's Manual
+	// Figure 5-1 gives it as "Mapped" in all three operating modes -- with one
+	// exception, recorded in that figure's own note 3:
+	//
+	//   "The Kernel mode user space, or kuseg, is unmapped when Status.ERL=1
+	//    (when the level 2 exception handler is executing)."
+	//
+	// The processor comes up in error level: the Status register table gives
+	// ERL, bit 2, Initial Value 1, which is why the reset value written in
+	// cpuReset() is 0x70400004. So reset installs the *direct* map, and
+	// cpuUpdateOperationMode() hands the segment over to the TLB when the guest
+	// clears ERL.
+	//
+	// This used to be an unconditional identity map with no ERL involvement,
+	// and strict behaviour needed PCSX2_STRICT_USEG in the environment. The
+	// starting state was right by accident and never withdrawn, so an address
+	// the guest had never mapped went on resolving instead of faulting --
+	// bypassing the TLB for the one segment the TLB exists to govern.
+	//
+	// Forced rather than requested: s_kusegDirect is already true, so the
+	// early-out in memApplyKuseg() would skip the vtlb writes a fresh reset
+	// needs.
+	s_kusegDirect = false;
+	memApplyKuseg(true);
 
 	std::memset(s_ba, 0, sizeof(s_ba));
 

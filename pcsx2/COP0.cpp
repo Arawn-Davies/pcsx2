@@ -4,26 +4,52 @@
 #include "Common.h"
 #include "COP0.h"
 
-// Updates the CPU's mode of operation (either, Kernel, Supervisor, or User modes).
-// Currently the different modes are not implemented.
-// Given this function is called so much, it's commented out for now. (rama)
+extern int eeTraceBudget;   // defined in R5900.cpp
+
+void MapTLB(const tlbs& t, int i);
+
+// Applies the part of the address map that moves with the operating mode.
+//
+// EE Core User's Manual Figure 5-1, note 3: "The Kernel mode user space, or
+// kuseg, is unmapped when Status.ERL=1 (when the level 2 exception handler is
+// executing)." Otherwise kuseg is TLB-mapped, in all three modes.
+//
+// Nothing else in the map moves with the mode. kseg0 and kseg1 are unmapped
+// always (Fig. 5-1 note 1), and what separates User, Supervisor and Kernel
+// otherwise is which segments may legally be touched -- an Address Error
+// question, not a translation one, and handled elsewhere.
+//
+// This was previously an empty stub, so the ERL rule was not modelled at all.
 __ri void cpuUpdateOperationMode()
 {
+	const bool direct = (cpuRegs.CP0.n.Status.b.ERL != 0);
 
-	//u32 value = cpuRegs.CP0.n.Status.val;
+	// memApplyKuseg() owns the "what is installed" state and returns false when
+	// nothing moved. This function runs on every exception entry and every
+	// ERET, so that early-out is what keeps it from rewriting 2GB of page map
+	// on each call.
+	if (!memApplyKuseg(direct))
+		return;
 
-	//if (value & 0x06 ||
-	//	(value & 0x18) == 0) { // Kernel Mode (KSU = 0 | EXL = 1 | ERL = 1)*/
-	//	memSetKernelMode();	// Kernel memory always
-	//} else { // User Mode
-	//	memSetUserMode();
-	//}
+	if (!direct)
+	{
+		// Leaving ERL hands kuseg back to the TLB, and memApplyKuseg() has just
+		// cleared the whole range to do it. Reinstate whatever the 48 entries
+		// map, or the guest loses every mapping it held across the level 2
+		// handler.
+		for (int i = 0; i < 48; i++)
+			MapTLB(tlb[i], i);
+	}
 }
 
 void WriteCP0Status(u32 value)
 {
 	COP0_UpdatePCCR();
 	cpuRegs.CP0.n.Status.val = value;
+	// Status.ERL is writable here, and moving it moves kuseg. Nothing called
+	// this before, so an MTC0 that set or cleared ERL changed the mode on paper
+	// and left the address map alone.
+	cpuUpdateOperationMode();
 	cpuSetNextEventDelta(4);
 }
 
@@ -224,10 +250,37 @@ __fi void COP0_UpdatePCCR()
 //
 
 
+// The vtlb is one flat address space with no notion of an ASID, so it can only
+// ever hold one of them at a time. Every process's mappings used to be written
+// into it together and the last writer won -- one process could read another's
+// pages at the same virtual address. Nothing notices while there is a single
+// address space, which is why it only bites once init forks.
+//
+// Which address space is installed is tracked here rather than read out of
+// EntryHi at the moment of each map or unmap. EntryHi is not a reliable
+// statement of the running process: TLBR loads it from an entry, and Linux's
+// flush loops put the ASID of whichever mm they are flushing into it while
+// they probe. Filtering on it directly leaves the vtlb holding a mixture of
+// address spaces with no record of which pages came from where -- and a
+// pointer read out of the wrong process's page is how a store to an address
+// like 0x3 happens.
+//
+// This only ever changes through a full rebuild, so whatever is installed is
+// always exactly one address space.
+static u32 tlbInstalledASID = 0;
+
+static bool tlbSlotIsInstalled(const tlbs& t)
+{
+	return t.isGlobal() || (t.EntryHi.ASID == tlbInstalledASID);
+}
+
 void MapTLB(const tlbs& t, int i)
 {
 	u32 mask, addr;
 	u32 saddr, eaddr;
+
+	if (!tlbSlotIsInstalled(t))
+		return;
 
 	COP0_LOG("MAP TLB %d: 0x%08X-> [0x%08X 0x%08X] S=%d G=%d ASID=%d Mask=0x%03X EntryLo0 PFN=%x EntryLo0 Cache=%x EntryLo1 PFN=%x EntryLo1 Cache=%x VPN2=%x",
 		i, t.VPN2(), t.PFN0(), t.PFN1(), t.isSPR() >> 31, t.isGlobal(), t.EntryHi.ASID,
@@ -256,7 +309,11 @@ void MapTLB(const tlbs& t, int i)
 			{
 				if ((addr & mask) == ((t.VPN2() >> 12) & mask))
 				{ //match
-					memSetPageAddr(addr << 12, t.PFN0() + ((addr - saddr) << 12));
+					// D clear means the guest wants a store here to trap.
+					if (t.EntryLo0.D)
+						memSetPageAddr(addr << 12, t.PFN0() + ((addr - saddr) << 12));
+					else
+						memSetPageAddrReadOnly(addr << 12);
 					Cpu->Clear(addr << 12, 0x400);
 				}
 			}
@@ -272,7 +329,11 @@ void MapTLB(const tlbs& t, int i)
 			{
 				if ((addr & mask) == ((t.VPN2() >> 12) & mask))
 				{ //match
-					memSetPageAddr(addr << 12, t.PFN1() + ((addr - saddr) << 12));
+					// D clear means the guest wants a store here to trap.
+					if (t.EntryLo1.D)
+						memSetPageAddr(addr << 12, t.PFN1() + ((addr - saddr) << 12));
+					else
+						memSetPageAddrReadOnly(addr << 12);
 					Cpu->Clear(addr << 12, 0x400);
 				}
 			}
@@ -291,6 +352,9 @@ __inline u32 ConvertPageMask(const u32 PageMask)
 
 void UnmapTLB(const tlbs& t, int i)
 {
+	if (!tlbSlotIsInstalled(t))
+		return;
+
 	//Console.WriteLn("Clear TLB %d: %08x-> [%08x %08x] S=%d G=%d ASID=%d Mask= %03X", i,t.VPN2,t.PFN0,t.PFN1,t.S,t.G,t.ASID,t.Mask);
 	u32 mask, addr;
 	u32 saddr, eaddr;
@@ -392,6 +456,39 @@ void WriteTLB(int i)
 namespace R5900 {
 namespace Interpreter {
 namespace OpcodeImpl {
+// The R5900's Random register is a free-running down-counter over the TLB
+// entries TLBWR is allowed to replace. It counts from 47 down to the value in
+// Wired and wraps, and hardware reloads it with 47 whenever Wired is written.
+//
+// It was never written here, so it held 0 for the life of the VM and every
+// TLBWR replaced entry 0 -- a 48-entry TLB acting as a one-entry one. Games do
+// not notice: they map memory with TLBWI at indices they choose and never
+// issue TLBWR. Linux does, in its TLB refill handler.
+static u32 cop0Random()
+{
+	const u32 wired = cpuRegs.CP0.n.Wired & 0x3f;
+
+	// Nothing left to rotate through (and 48 - wired must not underflow).
+	if (wired >= 47)
+		return 47;
+
+	return 47 - static_cast<u32>(cpuRegs.cycle % (48 - wired));
+}
+
+// Whether the guest ever writes a valid entry is the whole question: a zero
+// EntryLo means the refill handler loaded a zero PTE, which points upstream at
+// the page tables rather than at the TLB itself.
+static void eeTraceTlbWrite(const char* what, u32 idx)
+{
+	if (::eeTraceBudget <= 0)
+		return;
+	::eeTraceBudget--;
+	Console.WriteLn("  %s idx=%2u hi=%08x lo0=%08x lo1=%08x mask=%08x V=%d/%d",
+		what, idx, cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.EntryLo0,
+		cpuRegs.CP0.n.EntryLo1, cpuRegs.CP0.n.PageMask,
+		(cpuRegs.CP0.n.EntryLo0 >> 1) & 1, (cpuRegs.CP0.n.EntryLo1 >> 1) & 1);
+}
+
 namespace COP0 {
 
 	void TLBR()
@@ -432,12 +529,15 @@ namespace COP0 {
 			cpuRegs.CP0.n.Index, cpuRegs.CP0.n.PageMask, cpuRegs.CP0.n.EntryHi,
 			cpuRegs.CP0.n.EntryLo0, cpuRegs.CP0.n.EntryLo1);
 
+		eeTraceTlbWrite("TLBWI", j);
 		UnmapTLB(tlb[j], j);
 		WriteTLB(j);
 	}
 
 	void TLBWR()
 	{
+		cpuRegs.CP0.n.Random = cop0Random();
+
 		const u8 j = cpuRegs.CP0.n.Random & 0x3f;
 
 		if (j > 47)
@@ -446,41 +546,42 @@ namespace COP0 {
 			return;
 		}
 
-		DevCon.Warning("COP0_TLBWR %d:%x,%x,%x,%x\n",
+		COP0_LOG("COP0_TLBWR %d:%x,%x,%x,%x\n",
 			cpuRegs.CP0.n.Random, cpuRegs.CP0.n.PageMask, cpuRegs.CP0.n.EntryHi,
 			cpuRegs.CP0.n.EntryLo0, cpuRegs.CP0.n.EntryLo1);
 
+		eeTraceTlbWrite("TLBWR", j);
 		UnmapTLB(tlb[j], j);
 		WriteTLB(j);
 	}
 
 	void TLBP()
 	{
-		int i;
-
-		union
-		{
-			struct
-			{
-				u32 VPN2 : 19;
-				u32 VPN2X : 2;
-				u32 G : 3;
-				u32 ASID : 8;
-			} s;
-			u32 u;
-		} EntryHi32;
-
-		EntryHi32.u = cpuRegs.CP0.n.EntryHi;
+		// The bitfield union that used to live here had EntryHi's fields in the
+		// opposite order to the register: VPN2 was read off the ASID end and
+		// ASID off the VPN2 end. It then compared that against VPN2(), which is
+		// a byte address (<<13), so the two were never on the same terms and a
+		// probe of a real entry reported "not found". Linux's TLB-invalid
+		// handler probes before it fixes an entry up, so it could never find
+		// the entry it had just installed.
+		const u32 probeVPN2 = cpuRegs.CP0.n.EntryHi & ~0x1fffu;
+		const u32 probeASID = cpuRegs.CP0.n.EntryHi & 0xff;
 
 		cpuRegs.CP0.n.Index = 0xFFFFFFFF;
-		for (i = 0; i < 48; i++)
+
+		for (int i = 0; i < 48; i++)
 		{
-			if (tlb[i].VPN2() == ((~tlb[i].Mask()) & (EntryHi32.s.VPN2)) && ((tlb[i].isGlobal()) || ((tlb[i].EntryHi.ASID & 0xff) == EntryHi32.s.ASID)))
-			{
-				cpuRegs.CP0.n.Index = i;
-				break;
-			}
+			// VPN2() has the entry's page mask already applied, so apply the
+			// same mask to the address being probed before comparing.
+			if (tlb[i].VPN2() != (probeVPN2 & ~(tlb[i].Mask() << 13)))
+				continue;
+			if (!tlb[i].isGlobal() && (tlb[i].EntryHi.ASID != probeASID))
+				continue;
+
+			cpuRegs.CP0.n.Index = i;
+			break;
 		}
+
 		if (cpuRegs.CP0.n.Index == 0xFFFFFFFF)
 			cpuRegs.CP0.n.Index = 0x80000000;
 	}
@@ -494,6 +595,12 @@ namespace COP0 {
 		//if(bExecBIOS == FALSE && _Rd_ == 25) Console.WriteLn("MFC0 _Rd_ %x = %x", _Rd_, cpuRegs.CP0.r[_Rd_]);
 		switch (_Rd_)
 		{
+			case 1:
+				// Random is a counter, not a stored value.
+				cpuRegs.CP0.n.Random = cop0Random();
+				cpuRegs.GPR.r[_Rt_].SD[0] = (s32)cpuRegs.CP0.n.Random;
+				break;
+
 			case 12:
 				cpuRegs.GPR.r[_Rt_].SD[0] = (s32)(cpuRegs.CP0.r[_Rd_] & 0xf0c79c1f);
 				break;
@@ -546,6 +653,35 @@ cpuRegs.PERF.n.pccr, cpuRegs.PERF.n.pcr0, cpuRegs.PERF.n.pcr1, _Imm_ & 0x3F);*/
 			case 9:
 				cpuRegs.lastCOP0Cycle = cpuRegs.cycle;
 				cpuRegs.CP0.r[9] = cpuRegs.GPR.r[_Rt_].UL[0];
+				break;
+
+			case 10:
+			{
+				// EntryHi carries the ASID, so writing it can switch address
+				// space. Tear the old one out before building the new one:
+				// they overlap, so interleaving would leave the unmaps
+				// stamping on mappings just installed.
+				const u32 newASID = cpuRegs.GPR.r[_Rt_].UL[0] & 0xff;
+
+				cpuRegs.CP0.n.EntryHi = cpuRegs.GPR.r[_Rt_].UL[0];
+
+				if (newASID != tlbInstalledASID)
+				{
+					for (int t = 0; t < 48; t++)
+						UnmapTLB(tlb[t], t);
+
+					tlbInstalledASID = newASID;
+
+					for (int t = 0; t < 48; t++)
+						MapTLB(tlb[t], t);
+				}
+				break;
+			}
+
+			case 6:
+				// Writing Wired reloads Random with the top TLB index.
+				cpuRegs.CP0.n.Wired = cpuRegs.GPR.r[_Rt_].UL[0];
+				cpuRegs.CP0.n.Random = 47;
 				break;
 
 			case 12:

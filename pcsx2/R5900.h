@@ -398,6 +398,7 @@ extern uint dmacInterrupt();
 
 extern void cpuReset();
 extern void cpuException(u32 code, u32 bd);
+extern void cpuTlbModified(u32 addr, u32 bd);
 extern void cpuTlbMissR(u32 addr, u32 bd);
 extern void cpuTlbMissW(u32 addr, u32 bd);
 extern void cpuTestHwInts();

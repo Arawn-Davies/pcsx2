@@ -8,6 +8,7 @@
 #include "LogWindow.h"
 #include "MainWindow.h"
 #include "QtHost.h"
+#include "pcsx2/PS2Linux.h"
 #include "QtProgressCallback.h"
 #include "QtUtils.h"
 #include "SetupWizardDialog.h"
@@ -2117,6 +2118,8 @@ std::shared_ptr<VMBootParameters>& QtHost::AutoBoot(std::shared_ptr<VMBootParame
 	return autoboot;
 }
 
+static PS2Linux::BootParams s_ps2linux_boot;
+
 bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VMBootParameters>& autoboot)
 {
 	bool no_more_args = false;
@@ -2158,6 +2161,36 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 			else if (CHECK_ARG(QStringLiteral("-portable")))
 			{
 				EmuConfig.IsPortableMode = true;
+				continue;
+			}
+			// PS2 Linux direct boot -- load a kernel and initrd straight into
+			// memory with the real TGE SBIOS, skipping kernelloader entirely.
+			// -kernel is what switches the whole path on.
+			else if (CHECK_ARG_PARAM(QStringLiteral("-kernel")))
+			{
+				s_ps2linux_boot.kernel = (++it)->toStdString();
+				continue;
+			}
+			else if (CHECK_ARG_PARAM(QStringLiteral("-initrd")))
+			{
+				s_ps2linux_boot.initrd = (++it)->toStdString();
+				continue;
+			}
+			else if (CHECK_ARG_PARAM(QStringLiteral("-sbios")))
+			{
+				s_ps2linux_boot.sbios = (++it)->toStdString();
+				continue;
+			}
+			// Repeatable, and order matters -- the stub starts them in the order
+			// given, as kernelloader does.
+			else if (CHECK_ARG_PARAM(QStringLiteral("-iop-module")))
+			{
+				s_ps2linux_boot.iop_modules.push_back((++it)->toStdString());
+				continue;
+			}
+			else if (CHECK_ARG_PARAM(QStringLiteral("-cmdline")))
+			{
+				s_ps2linux_boot.cmdline = (++it)->toStdString();
 				continue;
 			}
 			else if (CHECK_ARG(QStringLiteral("-fastboot")))
@@ -2283,6 +2316,16 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 			AutoBoot(autoboot)->filename += ' ';
 
 		AutoBoot(autoboot)->filename += it->toStdString();
+	}
+
+	// A PS2 Linux direct boot has no disc and no ELF -- the kernel goes
+	// straight into memory -- so hand the parameters to PS2Linux and give
+	// autoboot a source type, or the check below discards it for having no
+	// boot parameters and nothing ever starts.
+	if (!s_ps2linux_boot.kernel.empty())
+	{
+		PS2Linux::SetRequestedBootParams(s_ps2linux_boot);
+		AutoBoot(autoboot)->source_type = CDVD_SourceType::NoDisc;
 	}
 
 	// check autoboot parameters, if we set something like fullscreen without a bios
