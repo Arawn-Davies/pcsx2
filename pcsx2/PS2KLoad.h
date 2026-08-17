@@ -27,13 +27,20 @@ namespace PS2KLoad
 		std::string initrd;   // optional; gzipped is fine, kernelloader unpacks it
 		std::string cmdline;  // optional; goes into config.txt's KernelParameter
 
+		// Selects which bundled kloader ELF to stage (kloader.elf vs
+		// kloader-instant.elf, see Stage()'s own comment) and, separately,
 		// config.txt's AutoBootTime, verified against loader/main.cpp's own
 		// countdown loop: 0 means "off" -- always interactive, never
 		// auto-boots, the opposite of what the name suggests. false selects
 		// 3 (a countdown worth reading); true selects the negative sentinel
-		// (-1) added specifically for this -- see main.cpp's
-		// `if (loaderConfig.autoBootTime < 0)` branch -- which skips the
-		// countdown screen entirely and boots straight through.
+		// (-1) -- see main.cpp's `if (loaderConfig.autoBootTime < 0)` branch,
+		// which skips the countdown screen entirely and boots straight
+		// through. loaderConfig.instantBoot (set by kloader-instant.elf,
+		// unconditionally, at the very first line of main()) is a separate
+		// thing -- it only moves bootlogBegin() earlier and is checked
+		// nowhere else, so it does NOT gate or replace this AutoBootTime
+		// check. -1 is still required for the instant path to actually skip
+		// the menu; without it the loader sits waiting for pad input.
 		bool instant = false;
 	};
 

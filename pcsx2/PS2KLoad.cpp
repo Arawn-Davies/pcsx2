@@ -4,6 +4,7 @@
 #include "PS2KLoad.h"
 
 #include "Config.h"
+#include "Host.h"
 #include "common/Console.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
@@ -96,10 +97,41 @@ namespace PS2KLoad
 			configTxt += fmt::format("InitrdFileName=host:{}\n", Path::GetFileName(stagedInitrd));
 		configTxt += fmt::format("KernelParameter={}\n",
 			params.cmdline.empty() ? "root=/dev/ram0 rw ramdisk_size=16384 romcons console=tty0 console=romcons init=/minish" : params.cmdline);
-		// See BootParams::instant's comment: 0 here would mean "never
-		// auto-boot", not "boot instantly" -- -1 is the real instant-boot
-		// sentinel, added to loader/main.cpp specifically for kload.
+		// Corrected back to -1 after a wrong deduction: loaderConfig.instantBoot
+		// (set unconditionally by kloader-instant.elf, before main.cpp's own
+		// `if (loaderConfig.autoBootTime < 0)` block) is checked NOWHERE else
+		// in main.cpp -- grep confirms it. It only moves bootlogBegin() to the
+		// earliest possible line; it does not gate or skip the AutoBootTime
+		// check later in main(). That later check is still what has to fire,
+		// and only `< 0` takes the "skip straight through" branch (renormalizing
+		// itself back to a valid 0 as its first statement, so there is no
+		// stray-negative risk after all). AutoBootTime=0 falls into neither
+		// branch and leaves the loader sitting at an interactive menu waiting
+		// for pad input -- confirmed the hard way as "pad 1 initalization
+		// failed!" (loader/pad.c) with no real controller behind it.
 		configTxt += fmt::format("AutoBootTime={}\n", params.instant ? -1 : 3);
+
+		// kernelreloaded defaults to retail-safe: plain 32MB unless it was
+		// compiled with FAKE_MAXMEM_MB, a build-time guess. PCSX2 does not
+		// have to guess -- it already knows whether the 128MB devkit map
+		// (ExtraMemory=true) is actually backing that memory or not, so it
+		// says so here instead of leaving kernelloader to assume anything.
+		// A boolean, not a byte count: kernelreloaded already knows the one
+		// number that matters (128MB, the T10K devkit layout PCSX2's
+		// ExtraMemory=true actually maps) -- see loaderConfig.enableExtraMem's
+		// comment in loader.h.
+		//
+		// Read directly from the ini (Host::GetBaseBoolSettingValue), not
+		// EmuConfig.Cpu.ExtraMemory and not memGetExtraMemMode(): both
+		// reflect VMManager.cpp's memSetExtraMemMode(EmuConfig.Cpu.ExtraMemory),
+		// which only runs once the VM actually starts. Stage() runs before
+		// that (see this function's own call site comment in QtHost.cpp), so
+		// both read as unset regardless of the real ini value -- confirmed
+		// the hard way as "EmuConfig.Cpu.ExtraMemory=false" with
+		// ExtraMemory=true sitting in PCSX2.ini the whole time. The ini
+		// itself has no such ordering dependency.
+		const bool enableExtraMem = Host::GetBaseBoolSettingValue("EmuCore/CPU", "ExtraMemory", false);
+		configTxt += fmt::format("EnableExtraMem={}\n", enableExtraMem ? 1 : 0);
 
 		const std::string configPath = Path::Combine(stageDir, "config.txt");
 		std::ofstream configFile(configPath, std::ios::binary);
