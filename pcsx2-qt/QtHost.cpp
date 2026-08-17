@@ -9,6 +9,7 @@
 #include "MainWindow.h"
 #include "QtHost.h"
 #include "pcsx2/PS2Linux.h"
+#include "pcsx2/PS2KLoad.h"
 #include "QtProgressCallback.h"
 #include "QtUtils.h"
 #include "SetupWizardDialog.h"
@@ -74,6 +75,7 @@ namespace QtHost
 	static void PrintCommandLineHelp(const std::string_view progname);
 	static std::shared_ptr<VMBootParameters>& AutoBoot(std::shared_ptr<VMBootParameters>& autoboot);
 	static bool ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VMBootParameters>& autoboot);
+	static bool StageKLoadBoot(const std::shared_ptr<VMBootParameters>& autoboot);
 	static bool InitializeConfig();
 	static void SaveSettings();
 	static void HookSignals();
@@ -2119,6 +2121,7 @@ std::shared_ptr<VMBootParameters>& QtHost::AutoBoot(std::shared_ptr<VMBootParame
 }
 
 static PS2Linux::BootParams s_ps2linux_boot;
+static PS2KLoad::BootParams s_ps2kload_boot;
 
 bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VMBootParameters>& autoboot)
 {
@@ -2191,6 +2194,34 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 			else if (CHECK_ARG_PARAM(QStringLiteral("-cmdline")))
 			{
 				s_ps2linux_boot.cmdline = (++it)->toStdString();
+				continue;
+			}
+			// kload -- boot PS2 Linux through the real kernelloader.elf
+			// (bundled, see PS2KLoad.cpp) instead of dload's direct memory
+			// load above. Independent of -kernel/-initrd/-sbios/-iop-module;
+			// -kload-kernel is what switches this path on.
+			else if (CHECK_ARG_PARAM(QStringLiteral("-kload-kernel")))
+			{
+				s_ps2kload_boot.kernel = (++it)->toStdString();
+				continue;
+			}
+			else if (CHECK_ARG_PARAM(QStringLiteral("-kload-initrd")))
+			{
+				s_ps2kload_boot.initrd = (++it)->toStdString();
+				continue;
+			}
+			else if (CHECK_ARG_PARAM(QStringLiteral("-kload-cmdline")))
+			{
+				s_ps2kload_boot.cmdline = (++it)->toStdString();
+				continue;
+			}
+			// See PS2KLoad::BootParams::instant -- kernelloader has no
+			// config-only path to zero visible countdown frames, so this
+			// selects the practical minimum (1s) rather than a literal
+			// zero, which would mean "never auto-boot" instead.
+			else if (CHECK_ARG(QStringLiteral("-kload-instant")))
+			{
+				s_ps2kload_boot.instant = true;
 				continue;
 			}
 			else if (CHECK_ARG(QStringLiteral("-fastboot")))
@@ -2328,9 +2359,25 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 		AutoBoot(autoboot)->source_type = CDVD_SourceType::NoDisc;
 	}
 
+	// kload's actual staging (PS2KLoad::Stage()) can't happen here: it needs
+	// EmuFolders::Resources to find the bundled kloader.elf, and that is not
+	// set until QtHost::InitializeConfig() -> EmuFolders::SetAppRoot(),
+	// which main() calls *after* this function returns. Just make sure
+	// autoboot exists so the "nothing to boot" check below does not discard
+	// it; QtHost::StageKLoadBoot() (called from main(), after
+	// InitializeConfig()) does the rest.
+	if (!s_ps2kload_boot.kernel.empty())
+		AutoBoot(autoboot);
+
 	// check autoboot parameters, if we set something like fullscreen without a bios
 	// or disc, we don't want to actually start.
-	if (autoboot && !autoboot->source_type.has_value() && autoboot->filename.empty() && autoboot->elf_override.empty())
+	//
+	// kload's filename is still empty here -- it isn't staged until main()
+	// calls QtHost::StageKLoadBoot(), after EmuFolders is initialized -- so
+	// it needs its own exemption alongside the other three, or this discards
+	// autoboot before that ever runs.
+	if (autoboot && !autoboot->source_type.has_value() && autoboot->filename.empty() &&
+		autoboot->elf_override.empty() && s_ps2kload_boot.kernel.empty())
 	{
 		Console.Warning("Skipping autoboot due to no boot parameters.");
 		autoboot.reset();
@@ -2352,6 +2399,29 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 		return false;
 	}
 
+	return true;
+}
+
+// Does kload's actual staging (PS2KLoad::Stage()), deferred out of
+// ParseCommandLineOptions() because it needs EmuFolders::Resources to find
+// the bundled kloader.elf, and that isn't set until
+// QtHost::InitializeConfig() -> EmuFolders::SetAppRoot() -- which runs
+// after command-line parsing, not before. No-op if -kload-kernel was not
+// given. Call after InitializeConfig() succeeds and before the VM starts.
+bool QtHost::StageKLoadBoot(const std::shared_ptr<VMBootParameters>& autoboot)
+{
+	if (s_ps2kload_boot.kernel.empty())
+		return true;
+
+	std::string error;
+	const std::string stagedKloader = PS2KLoad::Stage(s_ps2kload_boot, &error);
+	if (stagedKloader.empty())
+	{
+		Console.Error(fmt::format("kload failed: {}", error));
+		return false;
+	}
+
+	autoboot->filename = stagedKloader;
 	return true;
 }
 
@@ -2453,6 +2523,12 @@ int main(int argc, char* argv[])
 
 	// Bail out if we can't find any config.
 	if (!QtHost::InitializeConfig())
+		return EXIT_FAILURE;
+
+	// EmuFolders::Resources is only valid from here on -- see
+	// QtHost::StageKLoadBoot()'s own comment for why this can't happen
+	// inside ParseCommandLineOptions().
+	if (autoboot && !QtHost::StageKLoadBoot(autoboot))
 		return EXIT_FAILURE;
 
 	// Are we just setting up the configuration?

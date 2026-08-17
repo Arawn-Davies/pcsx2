@@ -63,7 +63,12 @@ oprofile_data/
 *.kdev4
 /.kdev4*
 
-# Resources and docs in /bin are tracked
+# Resources and docs in /bin are tracked -- except kernelreloaded's, which is
+# a compiled build artifact (cross-compiled MIPS, not something this repo's
+# own build produces), not source content. kernelreloaded's own rule against
+# committing build output applies here too; tools/build-kloader-resource.sh
+# regenerates it before every build instead.
+/bin/resources/kernelreloaded
 /bin/**/*.dll
 /bin/**/*.dmp
 /bin/**/*.exp

@@ -7,6 +7,7 @@
 #include "ps2/BiosTools.h"
 #include "R5900.h"
 #include "PS2Linux.h"
+#include "Host.h"
 #include "R3000A.h"
 #include "ps2/pgif.h" // pgif init
 #include "VUmicro.h"
@@ -259,6 +260,16 @@ static u32 eeLastDump = 0;
 // replay the sequence by hand, then silence.
 int eeTraceBudget = 400;
 
+// Separate from eeTraceBudget on purpose -- NEARNULL is meant to survive that
+// budget being spent on unrelated spam, since it was written for a rare,
+// one-off signature. But "rare" assumed the fault resolves; a genuine crash
+// loop (a bad jump that re-faults on the same near-null address every cycle)
+// hits this at the same unbounded rate eeTraceBudget exists to guard against,
+// and did: 11M lines in a few seconds, enough to back up the Qt log window's
+// queued cross-thread appends and read as the whole process hanging. Bounded
+// the same way, just kept in its own pool.
+int eeNearNullBudget = 200;
+
 static const char* eeSeg(u32 a)
 {
 	if (a >= 0xE0000000) return "kseg3";
@@ -476,15 +487,36 @@ void cpuTlbMiss(u32 addr, u32 bd, u32 excode)
 
 	// A fault on a near-null address is never legitimate here, and it is the
 	// signature of the bash crash: exccode 3 (TLB store) reported at a pc
-	// whose instruction is a syscall, which performs no store. Log it in full
-	// regardless of the trace budget -- it is rare, so it cannot spam.
-	if (addr < 0x10000)
+	// whose instruction is a syscall, which performs no store. Logged outside
+	// eeTraceBudget so it survives that budget being spent elsewhere, but
+	// still bounded by its own budget -- see eeNearNullBudget.
+	if (addr < 0x10000 && eeNearNullBudget > 0)
 	{
+		eeNearNullBudget--;
 		Console.Error("  NEARNULL addr=%08x pc=%08x excode=%u branch=%u opcode=%08x "
 			"delayop=%08x epc=%08x cause=%08x",
 			addr, cpuRegs.pc, excode, (u32)cpuRegs.branch, cpuRegs.code,
 			cpuRegs.branch ? 1u : 0u,
 			cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.Cause);
+		if (eeNearNullBudget == 0)
+		{
+			// This is the generic signal, not a PS2Linux-specific one: the
+			// comment above already treats any near-null fault as never
+			// legitimate, and the same address has now faulted 200 times
+			// running, so this is not a fluke to let ride. Left running, it
+			// just spins at whatever fault rate the interpreter can sustain
+			// forever with no way for the guest to recover and nothing
+			// visible changing on screen -- indistinguishable from PCSX2
+			// itself having hung, which is exactly the failure mode a
+			// contained emulator (the QEMU comparison this was raised
+			// against) should not have. Ask to shut down rather than spin
+			// silently; allow_confirm=true still lets the user decline and
+			// inspect it themselves.
+			Console.Error("  NEARNULL: further messages suppressed (faulting in a tight loop)");
+			Host::ReportErrorAsync("Guest CPU crash loop detected",
+				fmt::format("Faulting repeatedly on near-null address 0x{:08x} at pc 0x{:08x}.", addr, cpuRegs.pc));
+			Host::RequestVMShutdown(true, false, false);
+		}
 	}
 
 	cpuRegs.CP0.n.BadVAddr = addr;
@@ -940,7 +972,22 @@ void eeloadHook()
 			if (PS2Linux::DirectBoot(PS2Linux::GetRequestedBootParams(), &db_error))
 				return;
 
+			// A partial failure here already means SBIOS/kernel/initrd bytes
+			// were written into memory the real EELOAD/OSDSYS path still
+			// expects to own, so letting the interpreter fall through and
+			// keep executing real EELOAD code on top of that runs on
+			// corrupted state -- observed in practice as an immediate
+			// near-null jump, spinning forever and hanging the UI (Windows
+			// marks it Not Responding once the log/Qt event queue backs up
+			// with it). Report the failure and ask to shut down instead of
+			// letting that happen; allow_confirm=true pops the same "Confirm
+			// Shutdown" dialog a manual stop does, so the user can decline
+			// and inspect the hung state if they want to, rather than either
+			// silently corrupting onward or being killed without asking.
 			Console.Error(fmt::format("PS2 Linux direct boot failed: {}", db_error));
+			Host::ReportErrorAsync("PS2 Linux direct boot failed", db_error);
+			Host::RequestVMShutdown(true, false, false);
+			return;
 		}
 	}
 

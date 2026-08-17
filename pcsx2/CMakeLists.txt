@@ -90,6 +90,7 @@ set(pcsx2Sources
 	Mdec.cpp
 	Memory.cpp
 	PS2Linux.cpp
+	PS2KLoad.cpp
 	MMI.cpp
 	MTGS.cpp
 	MTVU.cpp
@@ -175,6 +176,7 @@ set(pcsx2Headers
 	Memory.h
 	PS2Linux.h
 	PS2LinuxStub.h
+	PS2KLoad.h
 	MemoryTypes.h
 	Patch.h
 	PerformanceMetrics.h

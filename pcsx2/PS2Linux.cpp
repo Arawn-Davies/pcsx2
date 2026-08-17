@@ -4,6 +4,7 @@
 #include "PS2Linux.h"
 #include "PS2LinuxStub.h"
 
+#include "Cache.h"
 #include "Elfheader.h"
 #include "Hw.h"
 #include "Memory.h"
@@ -286,10 +287,21 @@ namespace PS2Linux
 			const u32 vaddr = ph[i].p_vaddr;
 			const u32 paddr = GuestPhys(vaddr);
 
-			if (vaddr < limit_lo || (static_cast<u64>(vaddr) + ph[i].p_memsz) > limit_hi)
+			// limit_lo/limit_hi bound the *physical* placement, not the raw
+			// vaddr. SBIOS and the kernel link into kseg0, where vaddr is
+			// physical + 0x80000000 (EE Core UM p114: kseg0 "is mapped to the
+			// physical address ... by subtracting 0x80000000"), but the stub
+			// is a standard ps2sdk ELF and links into kuseg instead, where
+			// vaddr already equals its physical address. GuestPhys() strips
+			// either segment down to the same physical quantity, so bounding
+			// paddr accepts both conventions instead of only the one SBIOS
+			// and the kernel happen to use.
+			const u32 limit_lo_phys = GuestPhys(limit_lo);
+			const u32 limit_hi_phys = GuestPhys(limit_hi);
+			if (paddr < limit_lo_phys || (static_cast<u64>(paddr) + ph[i].p_memsz) > limit_hi_phys)
 			{
-				*error = fmt::format("{}: segment {} at 0x{:08x}+0x{:x} is outside 0x{:08x}-0x{:08x}",
-					what, i, vaddr, ph[i].p_memsz, limit_lo, limit_hi);
+				*error = fmt::format("{}: segment {} at 0x{:08x} (phys 0x{:08x})+0x{:x} is outside phys 0x{:08x}-0x{:08x}",
+					what, i, vaddr, paddr, ph[i].p_memsz, limit_lo_phys, limit_hi_phys);
 				return false;
 			}
 
@@ -609,6 +621,33 @@ namespace PS2Linux
 		cpuRegs.GPR.n.a1.UD[0] = 0;
 		cpuRegs.GPR.n.a2.UD[0] = 0;
 		cpuRegs.GPR.n.a3.UD[0] = 0;
+
+		// eeloadHook() fires while EELOAD is genuinely running, and Status is
+		// whatever EELOAD's own execution left it as -- measured as
+		// KSU=2 (User mode; EE Core UM's own table: KSU=10,ERL=0,EXL=0 =
+		// "User mode", KSU=00 = "Kernel mode"). Every ps2sdk program,
+		// including kernelloader, runs in Kernel mode -- that is what
+		// EELOAD's real exec path establishes for a program it launches, and
+		// it is what SetupThread (which this stub deliberately does not call,
+		// see stub/ps2linux-stub.c) would also arrange as part of a normal
+		// launch. DirectBoot() bypasses that step, so it has to set the mode
+		// itself rather than inherit whatever EELOAD's own code happened to
+		// be running as when the hook fired.
+		cpuRegs.CP0.n.Status.b.KSU = 0;
+
+		// Every SBIOS/kernel/initrd/stub byte above was written by this host
+		// C++ function calling memcpy() directly into eeMem, not by the
+		// interpreter executing a guest store -- so none of it went through
+		// PCSX2's own cache model (Cache.cpp), which the interpreter's own
+		// loads and instruction fetches DO consult. Any tag that model still
+		// holds for these physical ranges, left over from EELOAD's real
+		// execution, is now stale, and a stale *dirty* line is worse than a
+		// stale clean one: its eventual writeback would overwrite what was
+		// just written here with whatever it cached before. SaveState.cpp's
+		// PostLoadPrep() faces the identical problem -- "memory changed
+		// under the CPU by a path the interpreter didn't see" -- and solves
+		// it the same way, right before resuming execution.
+		resetCache();
 
 		Console.WriteLn(fmt::format("PS2Linux: entering stub at 0x{:08x}, kernel 0x{:08x}",
 			stub_entry, kernel_entry));
