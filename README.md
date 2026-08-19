@@ -1,27 +1,40 @@
-# PCSX2
+# WhiteRhino
 
-![Windows Build Status](https://img.shields.io/github/actions/workflow/status/PCSX2/pcsx2/windows_build_matrix.yml?label=%F0%9F%96%A5%EF%B8%8F%20Windows%20Builds)
-![Linux Build Status](https://img.shields.io/github/actions/workflow/status/PCSX2/pcsx2/linux_build_matrix.yml?label=%F0%9F%90%A7%20Linux%20Builds)
-![MacOS Build Status](https://img.shields.io/github/actions/workflow/status/PCSX2/pcsx2/macos_build_matrix.yml?label=%F0%9F%8D%8E%20MacOS%20Builds)
-[![Codacy Badge](https://app.codacy.com/project/badge/Grade/1f7c0d75fec74d6daa6adb084e5b4f71)](https://app.codacy.com/gh/PCSX2/pcsx2/dashboard?utm_source=github.com&utm_medium=referral&utm_content=PCSX2/pcsx2&utm_campaign=Badge_Grade)
-[![Discord Server](https://img.shields.io/discord/309643527816609793?color=%235CA8FA&label=PCSX2%20Discord&logo=discord&logoColor=white)](https://discord.com/invite/TCz3t9k)
+WhiteRhino is a personal fork of [PCSX2](https://pcsx2.net/), the PS2
+emulator — not a general-purpose PCSX2 build, and not affiliated with the
+PCSX2 project. It exists for one specific job: getting **PS2 Linux**
+running reliably under emulation, which stock PCSX2 was never tuned for.
 
-PCSX2 is a free and open-source PlayStation 2 (PS2) emulator. Its purpose is to emulate the PS2's hardware, using a combination of MIPS CPU [Interpreters](<https://en.wikipedia.org/wiki/Interpreter_(computing)>), [Recompilers](https://en.wikipedia.org/wiki/Dynamic_recompilation) and a [Virtual Machine](https://en.wikipedia.org/wiki/Virtual_machine) which manages hardware states and PS2 system memory. This allows you to play PS2 games on your PC, with many additional features and benefits.
+## What's different from stock PCSX2
 
-## Project Details
+- **EE TLB/MMU accuracy fixes.** Booting a real OS (rather than a game)
+  exercises the Emotion Engine's memory-management unit much harder than
+  most game code does, and stock PCSX2 has a handful of bugs there that
+  a game rarely trips but a kernel boot reliably does. WhiteRhino carries
+  fixes for six of those, plus one in BIOS-syscall emulation.
+- **`kload` and `dload`** — two ways to boot PS2 Linux directly, without a
+  real console or a boot disc. `kload` is the reliable one: it stages a
+  real, unmodified `kloader.elf` (built fresh from
+  [kernelreloaded](https://github.com/Arawn-Davies/kernelreloaded), the
+  companion bootloader project this fork is built for) alongside a kernel
+  and initrd, then lets PCSX2 boot it exactly the way a real console
+  would boot anything else — no shortcuts taken with CPU state. `dload`
+  is the experimental alternative: a more direct boot path that pokes the
+  kernel straight into guest memory, still being chased down.
 
-PCSX2 has been in development for more than 20 years. Past versions could only run a few public domain game demos, but newer versions can run most games at full speed, including popular titles such as Final Fantasy X and Devil May Cry 3. Visit the [PCSX2 compatibility list](https://pcsx2.net/compat/) to check the latest compatibility status of games (with more than 2500 titles tested).
+If you just want to play PS2 games, you want
+[upstream PCSX2](https://github.com/PCSX2/pcsx2) — it's actively
+developed, well documented, and this fork doesn't try to compete with it.
 
-Installers and binaries for both stable and nightly builds are available from [our website](https://pcsx2.net/downloads/).
+## Building
 
-## System Requirements
+This fork is built the same way PCSX2 itself is; see
+[PCSX2's own build documentation](https://pcsx2.net/docs/contributing/)
+for the general instructions. Windows is where this fork gets exercised
+day to day, and `tools/build-windows.ps1` /
+`tools/build-kloader-resource.sh` handle the extra step `kload` needs —
+building kernelreloaded's `kloader.elf` fresh and embedding it as a
+resource.
 
-PCSX2 supports Windows, Linux, and Mac platforms. Our [setup documentation page](https://pcsx2.net/docs/setup/requirements) contains additional details on software and hardware requirements.
-
-Please note that a BIOS dump from a legitimately-owned PS2 console is required to use the emulator. For more information, visit [this page](https://pcsx2.net/docs/setup/bios/).
-
-## Contributing / Building
-
-PCSX2 supports translation into other languages using [Crowdin](https://crowdin.com/project/pcsx2-emulator).
-
-See the [Contribution Guide](https://pcsx2.net/docs/contributing/) for more info on how to contribute.
+You'll still need a BIOS dump from a legitimately-owned PS2, same as
+stock PCSX2.
