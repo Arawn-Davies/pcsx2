@@ -18,6 +18,7 @@
 #include "pcsx2/Achievements.h"
 #include "pcsx2/BuildVersion.h"
 #include "pcsx2/CDVD/CDVD.h"
+#include "pcsx2/R5900.h"
 #include "pcsx2/Counters.h"
 #include "pcsx2/DebugTools/Debug.h"
 #include "pcsx2/GS.h"
@@ -2222,6 +2223,17 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 			else if (CHECK_ARG(QStringLiteral("-kload-instant")))
 			{
 				s_ps2kload_boot.instant = true;
+				continue;
+			}
+			// kernelreloaded: comma-separated hex EE addresses (e.g.
+			// "0x800201a0,0x80020240") to dump full CPU state at every time
+			// the interpreter's pc hits one, independent of -kload-*.
+			// See kernelreloadedCheckBreakpoint() in R5900.cpp -- deliberately
+			// not the stock CBreakPoints/Qt Debugger path, which needs a
+			// PCSX2_DEVBUILD rebuild to even compile in.
+			else if (CHECK_ARG_PARAM(QStringLiteral("-kload-break")))
+			{
+				kernelreloadedSetBreakpoints((++it)->toStdString().c_str());
 				continue;
 			}
 			else if (CHECK_ARG(QStringLiteral("-fastboot")))

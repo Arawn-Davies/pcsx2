@@ -3,6 +3,9 @@
 
 #include "Common.h"
 
+#include <cstdlib>
+#include <vector>
+
 #include "common/StringUtil.h"
 #include "ps2/BiosTools.h"
 #include "R5900.h"
@@ -255,6 +258,55 @@ static u32 eeTlbMissLast = 0;
 static u32 eeTlbMissPrev = 0;
 static u32 eeLastDump = 0;
 
+static void cpuStateDump(bool force, const char* label);
+
+// kernelreloaded: on-demand breakpoint dumps, driven by -kload-break on the
+// CLI (QtHost.cpp). Deliberately separate from the stock CBreakPoints/
+// isBreakpointNeeded machinery in Interpreter.cpp, which is compiled out
+// entirely unless PCSX2_DEVBUILD or EXTRA_DEBUG is defined -- this needs to
+// work in the same plain release build build.sh produces. Checked every
+// instruction from execI(); the vector is empty unless -kload-break was
+// passed, so the cost when unused is one size()==0 check per instruction.
+static std::vector<u32> s_kernelreloadedBreakpoints;
+
+void kernelreloadedSetBreakpoints(const char* addrListCsv)
+{
+	s_kernelreloadedBreakpoints.clear();
+	if (!addrListCsv)
+		return;
+
+	std::string list(addrListCsv);
+	size_t pos = 0;
+	while (pos < list.size())
+	{
+		const size_t comma = list.find(',', pos);
+		const std::string tok = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+		if (!tok.empty())
+		{
+			const u32 addr = static_cast<u32>(std::strtoul(tok.c_str(), nullptr, 16));
+			s_kernelreloadedBreakpoints.push_back(addr);
+			Console.WriteLn("kernelreloaded: breakpoint armed at 0x%08x", addr);
+		}
+		if (comma == std::string::npos)
+			break;
+		pos = comma + 1;
+	}
+}
+
+void kernelreloadedCheckBreakpoint(u32 pc)
+{
+	if (s_kernelreloadedBreakpoints.empty())
+		return;
+	for (const u32 addr : s_kernelreloadedBreakpoints)
+	{
+		if (addr == pc)
+		{
+			cpuStateDump(true, "BREAKPOINT");
+			return;
+		}
+	}
+}
+
 
 // Bounded because the failure runs at ~10M faults a second: enough events to
 // replay the sequence by hand, then silence.
@@ -375,22 +427,28 @@ static const char* eeExcName(u32 code)
 	}
 }
 
-static void cpuStateDump()
+// force=true / label!=nullptr is the on-demand path from
+// kernelreloadedCheckBreakpoint() -- skips the interval gate entirely and
+// labels the dump so it's distinguishable in the log from the periodic one.
+static void cpuStateDump(bool force = false, const char* label = "EE state")
 {
 	// cpuRegs.cycle is declared u64 but wraps at 32 bits in practice, so a
 	// "next due" absolute deadline past 2^32 is never reached and the dump
 	// stops for good. Compare a 32-bit delta instead, which wraps with it.
 	static const u32 interval = 1500 * 1000 * 1000;
 
-	if (static_cast<u32>(static_cast<u32>(cpuRegs.cycle) - eeLastDump) < interval)
-		return;
-	eeLastDump = static_cast<u32>(cpuRegs.cycle);
+	if (!force)
+	{
+		if (static_cast<u32>(static_cast<u32>(cpuRegs.cycle) - eeLastDump) < interval)
+			return;
+		eeLastDump = static_cast<u32>(cpuRegs.cycle);
+	}
 
 	const u32 pc = cpuRegs.pc;
 	const u32 sp = cpuRegs.GPR.r[29].UL[0];
 	const u32 exc = (cpuRegs.CP0.n.Cause >> 2) & 0x1f;
 
-	Console.WriteLn("======== EE state @ cycle %llu ========", cpuRegs.cycle);
+	Console.WriteLn("======== %s @ cycle %llu ========", label, cpuRegs.cycle);
 	Console.WriteLn("pc   =%08x (%s)   sp=%08x (%s)   ra=%08x",
 		pc, eeSeg(pc), sp, eeSeg(sp), cpuRegs.GPR.r[31].UL[0]);
 

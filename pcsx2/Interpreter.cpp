@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "R5900.h"
 #include "R5900OpcodeTables.h"
 #include "VMManager.h"
 #include "Elfheader.h"
@@ -169,6 +170,13 @@ static void execI()
 #endif
 
 	const u32 pc = cpuRegs.pc;
+
+	// kernelreloaded: -kload-break CLI breakpoints. Separate from the stock
+	// CBreakPoints machinery above (compiled out unless PCSX2_DEVBUILD/
+	// EXTRA_DEBUG), so this works in the plain release build build.sh
+	// produces. No-op (one empty-vector check) unless -kload-break was passed.
+	kernelreloadedCheckBreakpoint(pc);
+
 	// We need to increase the pc before executing the memRead32. An exception could appears
 	// and it expects the PC counter to be pre-incremented
 	cpuRegs.pc += 4;

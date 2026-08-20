@@ -407,6 +407,13 @@ extern void GoemonPreloadTlb();
 extern void GoemonUnloadTlb(u32 key);
 
 extern void cpuSetNextEvent( u32 startCycle, s32 delta );
+
+// kernelreloaded: CLI-driven breakpoint dumps (see -kload-break in
+// QtHost.cpp), independent of the stock CBreakPoints/PCSX2_DEVBUILD
+// machinery so it works in a plain release build. Set once from the CLI
+// parser; checked every instruction from Interpreter.cpp's execI().
+extern void kernelreloadedSetBreakpoints(const char* addrListCsv);
+extern void kernelreloadedCheckBreakpoint(u32 pc);
 extern void cpuSetNextEventDelta( s32 delta );
 extern int  cpuTestCycle( u32 startCycle, s32 delta );
 extern void cpuSetEvent();
