@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstring>
+#include <iterator>
 #include <map>
 
 #include "common/Assertions.h"
@@ -213,7 +214,31 @@ public:
 			}
 		} while (idx++ < last);
 
-		// TODO: remove links from this block?
+		// Erase outgoing links this block range itself created -- entries in
+		// `links` whose jumpptr (the patch site) falls inside the code we're
+		// discarding here. Without this, BaseBlocks::New() can later find a
+		// stale entry filed under some completely unrelated target PC and
+		// blindly patch through that jumpptr once this code-cache memory has
+		// been handed out again to a different, currently-live block --
+		// silently corrupting its machine code. Upstream TODO since 2009
+		// (c483f17331); hit hard by kload's execve() into /minish, which
+		// discards and immediately recompiles heavily over the same
+		// code-cache addresses.
+		for (linkiter_t i = links.begin(); i != links.end();)
+		{
+			bool stale = false;
+			for (int j = first; j <= last; j++)
+			{
+				const uptr fn = blocks[j].fnptr;
+				if (i->second >= fn && i->second < fn + blocks[j].x86size)
+				{
+					stale = true;
+					break;
+				}
+			}
+			i = stale ? links.erase(i) : std::next(i);
+		}
+
 		blocks.erase(first, last + 1);
 	}
 

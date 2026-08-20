@@ -993,7 +993,12 @@ static __fi u32 psxRecClearMem(u32 pc)
 
 	pblock = PSX_GETBLOCK(pc);
 	// if ((u8*)iopJITCompile == pblock->GetFnptr())
-	if (pblock->GetFnptr() == (uptr)iopJITCompile)
+	// Also bail if this write lands inside the block currently being
+	// compiled: unlike the two checks below (which stop the extent scan
+	// from merging a *neighboring* s_pCurBlock into the removal range),
+	// this is pc itself falling inside s_pCurBlock -- mirrors the EE
+	// recompiler's self-write handling (ix86-32/iR5900.cpp's recClear).
+	if (pblock->GetFnptr() == (uptr)iopJITCompile || pblock == s_pCurBlock)
 		return 4;
 
 	pc = HWADDR(pc);
@@ -1006,6 +1011,15 @@ static __fi u32 psxRecClearMem(u32 pc)
 	{
 		if (pexblock->startpc + pexblock->size * 4 <= lowerextent)
 			break;
+		// Don't merge the currently-compiling block into the removal
+		// extent (EE's recClear has the equivalent s_pCurBlock check in
+		// its own extent walk, ix86-32/iR5900.cpp:753-761). Without this,
+		// BaseBlocks::Remove() -- even with its stale-outgoing-link fix --
+		// can still be handed a range containing a block whose x86 bytes
+		// are actively being emitted by the compiler right now, discarding
+		// its BASEBLOCKEX metadata and code-cache claim out from under it.
+		if (PSX_GETBLOCK(pexblock->startpc) == s_pCurBlock)
+			break;
 
 		lowerextent = std::min(lowerextent, pexblock->startpc);
 		blockidx--;
@@ -1016,6 +1030,8 @@ static __fi u32 psxRecClearMem(u32 pc)
 	while (BASEBLOCKEX* pexblock = recBlocks[blockidx])
 	{
 		if (pexblock->startpc >= upperextent)
+			break;
+		if (PSX_GETBLOCK(pexblock->startpc) == s_pCurBlock)
 			break;
 
 		lowerextent = std::min(lowerextent, pexblock->startpc);
