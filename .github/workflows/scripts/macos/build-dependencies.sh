@@ -120,7 +120,13 @@ echo "Installing SDL..."
 rm -fr "$SDL"
 tar xf "$SDL.tar.gz"
 cd "$SDL"
-cmake -B build "${CMAKE_COMMON[@]}" -DSDL_X11=OFF -DBUILD_SHARED_LIBS=ON
+# SDL_TESTS=OFF: local-only workaround, not upstream's problem. CI runners have
+# no system FFmpeg, so SDL's test/CMakeLists.txt find_package(FFmpeg) silently
+# finds nothing and skips testffmpeg. This machine has Homebrew's own (arm64)
+# ffmpeg on the default pkg-config path, which SDL happily finds and links
+# testffmpeg against -- while everything else here targets x86_64. Skip the
+# whole test/ directory; we only need the library.
+cmake -B build "${CMAKE_COMMON[@]}" -DSDL_X11=OFF -DBUILD_SHARED_LIBS=ON -DSDL_TESTS=OFF
 make -C build "-j$NPROCS"
 make -C build install
 cd ..

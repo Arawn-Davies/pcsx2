@@ -14,14 +14,17 @@
 #include "fmt/format.h"
 
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <optional>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <thread>
 #include <time.h>
+#include <unistd.h>
 #include <mach/mach_init.h>
 #include <mach/mach_port.h>
 #include <mach/mach_time.h>
@@ -689,6 +692,39 @@ void PageFaultHandler::SignalHandler(mach_port_t port)
 			msg_out.RetCode = KERN_FAILURE;
 			msg_out.flavor = 0;
 			msg_out.new_stateCnt = 0;
+
+			// CrashHandler::CrashSignalHandler() doesn't use the (sig, info, ctx)
+			// args on macOS -- Mach exceptions, not POSIX signals, so there's no
+			// real ucontext_t to hand it -- which means without logging here,
+			// nothing about *why* we're aborting survives: macOS's own crash
+			// reporter only sees where abort() itself was called from, not the
+			// original faulting instruction. dladdr()/snprintf()/write() are all
+			// safe to call from this thread (no malloc, no locks).
+#ifdef _M_ARM64
+			void* const fault_pc = reinterpret_cast<void*>(state->__pc);
+#else
+			void* const fault_pc = reinterpret_cast<void*>(state->__rip);
+#endif
+			void* const fault_addr = reinterpret_cast<void*>(msg_in.code[1]);
+			Dl_info dli = {};
+			char line[512];
+			int len;
+			if (dladdr(fault_pc, &dli) && dli.dli_sname)
+			{
+				len = snprintf(line, sizeof(line),
+					"*** Unhandled page fault: pc=%p (%s+0x%llx in %s) fault_addr=%p write=%d ***\n",
+					fault_pc, dli.dli_sname,
+					static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(fault_pc) - reinterpret_cast<uintptr_t>(dli.dli_saddr)),
+					dli.dli_fname ? dli.dli_fname : "?", fault_addr, (msg_in.code[0] & 2) != 0);
+			}
+			else
+			{
+				len = snprintf(line, sizeof(line),
+					"*** Unhandled page fault: pc=%p (no symbol -- likely JIT-generated code) fault_addr=%p write=%d ***\n",
+					fault_pc, fault_addr, (msg_in.code[0] & 2) != 0);
+			}
+			if (len > 0)
+				write(STDERR_FILENO, line, static_cast<size_t>(len));
 
 			// The crash handler on macOS or Linux doesn't use context passed to it
 			// Stubbing it here is fine
