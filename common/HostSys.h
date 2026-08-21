@@ -190,6 +190,14 @@ extern const u32 SPIN_TIME_NS;
 /// Like C abort() but adds the given message to the crashlog
 [[noreturn]] void AbortWithMessage(const char* msg);
 
+/// Shows the user a synchronous, native alert (not routed through Qt --
+/// no dependency on the GUI event loop or any other thread's cooperation),
+/// then unconditionally std::exit()s. For a condition that is fatal and
+/// already known unrecoverable (unlike AbortWithMessage's Abort/Retry/Ignore
+/// choice on Windows, this gives no option to continue) but where silently
+/// exiting would leave the user with no idea what happened.
+[[noreturn]] void AlertUserAndExit(const char* msg);
+
 extern std::string GetOSVersionString();
 
 struct CPUInfo {

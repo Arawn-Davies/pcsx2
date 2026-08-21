@@ -13,6 +13,7 @@
 #include "DebugTools/Breakpoints.h"
 #include "Host.h"
 #include "VMManager.h"
+#include "common/HostSys.h"
 
 #include "fmt/format.h"
 
@@ -258,13 +259,78 @@ void COP2()
 	Int_COP2PrintTable[_Rs_]();
 }
 
-void Unknown() {
-	CPU_LOG("%8.8lx: Unknown opcode called", cpuRegs.pc);
+// A guest that hits any unimplemented opcode is, in the interpreter, stuck:
+// nothing here advances pc or otherwise changes guest state, so the exact
+// same instruction faults again next cycle -- forever, at however many
+// million instructions/sec the interpreter can sustain. Logging it
+// unconditionally (as this code did briefly, once, on 2026-08-22) fills the
+// log to hundreds of MB in under a second and reliably takes PCSX2 down with
+// it, indistinguishable from PCSX2 itself having hung. Budgeted the same way
+// R5900.cpp's eeNearNullBudget already handles the analogous "faulting in a
+// tight loop" case for near-null memory faults: log a bounded number of
+// hits, then ask to shut the VM down instead of spinning silently.
+static int eeUnknownOpcodeBudget = 200;
+static bool eeUnknownOpcodeCrashLoopReported = false;
+
+static void _unknownOpcodeCrashLoopCheck(const char* kind, u32 pc, u32 code)
+{
+	// eeUnknownOpcodeBudget only ever counts down to 0 and stays there, so
+	// checking "== 0" alone re-fires this every single call once exhausted --
+	// confirmed 2026-08-22: with nothing to advance the guest's pc, the
+	// interpreter calls back in here every cycle, and each call popped a
+	// fresh "guest crashed, shut down?" dialog -- thousands of them, not one.
+	// The explicit latch is the actual "only once" guard; the budget check
+	// above it just decides *when* to arm it.
+	if (eeUnknownOpcodeBudget != 0 || eeUnknownOpcodeCrashLoopReported)
+		return;
+	eeUnknownOpcodeCrashLoopReported = true;
+	Console.Error("  Unknown-opcode budget exhausted (faulting in a tight loop, last: %s pc=%8.8x code=%8.8x)",
+		kind, pc, code);
+	// Host::RequestVMShutdown() needs the CPU thread to reach a cooperative
+	// stop check -- confirmed 2026-08-22 this call site never does, since
+	// nothing here advances pc, so the interpreter is still calling straight
+	// back into this same function next cycle. The shutdown request queues
+	// onto the GUI thread fine and the confirm dialog appears, but clicking
+	// it then hangs waiting on a CPU-thread checkpoint that will never come.
+	// AlertUserAndExit() (common/HostSys.cpp) shows a synchronous native
+	// alert directly on this thread -- no Qt, no cooperative check -- then
+	// unconditionally exits. No Ignore/Retry option: this condition is
+	// already known unrecoverable.
+	AlertUserAndExit(fmt::format("Guest CPU crash loop detected: faulting repeatedly on an unimplemented {} opcode at pc 0x{:08x} (code 0x{:08x}).", kind, pc, code).c_str());
 }
 
-void MMI_Unknown() { Console.Warning("Unknown MMI opcode called"); }
-void COP0_Unknown() { Console.Warning("Unknown COP0 opcode called"); }
-void COP1_Unknown() { Console.Warning("Unknown FPU/COP1 opcode called"); }
+void Unknown() {
+	CPU_LOG("%8.8lx: Unknown opcode called", cpuRegs.pc);
+	if (eeUnknownOpcodeBudget > 0) {
+		eeUnknownOpcodeBudget--;
+		Console.Warning("Unknown opcode called: pc=%8.8lx code=%8.8lx", cpuRegs.pc, cpuRegs.code);
+	}
+	_unknownOpcodeCrashLoopCheck("generic", cpuRegs.pc, cpuRegs.code);
+}
+
+void MMI_Unknown() {
+	if (eeUnknownOpcodeBudget > 0) {
+		eeUnknownOpcodeBudget--;
+		Console.Warning("Unknown MMI opcode called: pc=%8.8lx code=%8.8lx rs=%d rt=%d rd=%d sa=%d funct=%d", cpuRegs.pc, cpuRegs.code, _Rs_, _Rt_, _Rd_, _Sa_, _Funct_);
+	}
+	_unknownOpcodeCrashLoopCheck("MMI", cpuRegs.pc, cpuRegs.code);
+}
+
+void COP0_Unknown() {
+	if (eeUnknownOpcodeBudget > 0) {
+		eeUnknownOpcodeBudget--;
+		Console.Warning("Unknown COP0 opcode called: pc=%8.8lx code=%8.8lx rs=%d funct=%d", cpuRegs.pc, cpuRegs.code, _Rs_, _Funct_);
+	}
+	_unknownOpcodeCrashLoopCheck("COP0", cpuRegs.pc, cpuRegs.code);
+}
+
+void COP1_Unknown() {
+	if (eeUnknownOpcodeBudget > 0) {
+		eeUnknownOpcodeBudget--;
+		Console.Warning("Unknown FPU/COP1 opcode called: pc=%8.8lx code=%8.8lx rs=%d rt=%d rd=%d funct=%d", cpuRegs.pc, cpuRegs.code, _Rs_, _Rt_, _Rd_, _Funct_);
+	}
+	_unknownOpcodeCrashLoopCheck("FPU/COP1", cpuRegs.pc, cpuRegs.code);
+}
 
 
 

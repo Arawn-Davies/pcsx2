@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common/StringUtil.h"
+#include "common/HostSys.h"
 #include "ps2/BiosTools.h"
 #include "R5900.h"
 #include "PS2Linux.h"
@@ -567,13 +568,22 @@ void cpuTlbMiss(u32 addr, u32 bd, u32 excode)
 			// visible changing on screen -- indistinguishable from PCSX2
 			// itself having hung, which is exactly the failure mode a
 			// contained emulator (the QEMU comparison this was raised
-			// against) should not have. Ask to shut down rather than spin
-			// silently; allow_confirm=true still lets the user decline and
-			// inspect it themselves.
+			// against) should not have.
+			//
+			// Ask to shut down was the original plan here (allow_confirm=true,
+			// so the user could decline and inspect the hung state) --
+			// confirmed 2026-08-22, via the same-shaped check in
+			// R5900OpcodeImpl.cpp's _unknownOpcodeCrashLoopCheck, that this
+			// does not work: Host::RequestVMShutdown() needs the CPU thread
+			// to reach a cooperative stop check, and this call site never
+			// advances pc, so the interpreter calls right back in here next
+			// cycle. The confirm dialog appears, but clicking it then hangs
+			// waiting on a checkpoint that will never come.
+			// AlertUserAndExit() (common/HostSys.cpp) shows a synchronous
+			// native alert directly on this thread -- no Qt, no cooperative
+			// check -- then unconditionally exits.
 			Console.Error("  NEARNULL: further messages suppressed (faulting in a tight loop)");
-			Host::ReportErrorAsync("Guest CPU crash loop detected",
-				fmt::format("Faulting repeatedly on near-null address 0x{:08x} at pc 0x{:08x}.", addr, cpuRegs.pc));
-			Host::RequestVMShutdown(true, false, false);
+			AlertUserAndExit(fmt::format("Guest CPU crash loop detected: faulting repeatedly on near-null address 0x{:08x} at pc 0x{:08x}.", addr, cpuRegs.pc).c_str());
 		}
 	}
 
@@ -1035,16 +1045,17 @@ void eeloadHook()
 			// expects to own, so letting the interpreter fall through and
 			// keep executing real EELOAD code on top of that runs on
 			// corrupted state -- observed in practice as an immediate
-			// near-null jump, spinning forever and hanging the UI (Windows
-			// marks it Not Responding once the log/Qt event queue backs up
-			// with it). Report the failure and ask to shut down instead of
-			// letting that happen; allow_confirm=true pops the same "Confirm
-			// Shutdown" dialog a manual stop does, so the user can decline
-			// and inspect the hung state if they want to, rather than either
-			// silently corrupting onward or being killed without asking.
+			// near-null jump, spinning forever. That specific case is now
+			// also caught by the NEARNULL crash-loop check above, but this
+			// fires first and shouldn't assume every corrupted-state outcome
+			// takes that exact shape. Host::RequestVMShutdown() needs the CPU
+			// thread to reach a cooperative stop check, which a spinning
+			// interpreter never does -- confirmed 2026-08-22 elsewhere in
+			// this file and in R5900OpcodeImpl.cpp. AlertUserAndExit()
+			// (common/HostSys.cpp) shows a synchronous native alert directly
+			// on this thread instead, then unconditionally exits.
 			Console.Error(fmt::format("PS2 Linux direct boot failed: {}", db_error));
-			Host::ReportErrorAsync("PS2 Linux direct boot failed", db_error);
-			Host::RequestVMShutdown(true, false, false);
+			AlertUserAndExit(fmt::format("PS2 Linux direct boot failed: {}", db_error).c_str());
 			return;
 		}
 	}

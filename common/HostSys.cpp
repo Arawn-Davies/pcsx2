@@ -5,8 +5,15 @@
 #include "Console.h"
 #include "VectorIntrin.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #ifndef __APPLE__
 #include "cpuinfo.h"
+#endif
+
+#ifdef _WIN32
+#include "RedtapeWindows.h"
 #endif
 
 static u32 PAUSE_TIME = 0;
@@ -138,6 +145,26 @@ void AbortWithMessage(const char* msg)
 	gCRAnnotations.backtrace = gCRAnnotations.message;
 #endif
 	abort();
+}
+
+void AlertUserAndExit(const char* msg)
+{
+#ifdef _WIN32
+	// A direct, blocking native call on the calling thread -- deliberately
+	// not Host::ReportErrorAsync/QMetaObject::invokeMethod, which queue onto
+	// the Qt GUI thread and were confirmed 2026-08-22 to never be serviced
+	// when called from an interpreter thread stuck re-executing the same
+	// instruction forever (nothing left to pump the GUI event loop with,
+	// and no cooperative stop check for it to reach either). MB_OK only --
+	// no Abort/Retry/Ignore choice like pxOnAssertFail's assertion dialog,
+	// since this path is for a condition already known unrecoverable.
+	MessageBoxA(NULL, msg, "Fatal error", MB_OK | MB_ICONERROR);
+#else
+	std::fputs(msg, stderr);
+	std::fputc('\n', stderr);
+	std::fflush(stderr);
+#endif
+	std::exit(1);
 }
 
 #ifndef __APPLE__
