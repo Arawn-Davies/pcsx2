@@ -9,6 +9,7 @@
 
 #include "fmt/format.h"
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -406,9 +407,51 @@ __ri void Log::UpdateMaxLevel()
 	s_max_level = std::max(s_console_level, std::max(s_debug_level, std::max(s_file_level, s_host_level)));
 }
 
+// Log-wide safety net, deliberately separate from any per-call-site budget
+// (e.g. R5900OpcodeImpl.cpp's eeNearNullBudget/eeUnknownOpcodeBudget): those
+// only protect the specific callers someone remembered to guard. Every log
+// line from every caller -- console, file, debug output, host/Qt callback --
+// funnels through here, so this is the one place that can catch a runaway
+// *regardless* of which code path is spamming. Confirmed necessary
+// 2026-08-22: an unguarded interpreter warning in a guest CPU crash loop
+// produced an 860MB / 13.8M-line log file and took PCSX2 down with it in
+// under a second -- the file sink's fprintf+fflush-per-line alone was enough
+// to make that fast. common/ is host-agnostic (no Host:: dependency
+// permitted here), so this only suppresses; it does not attempt to stop
+// whatever guest-side condition is spamming -- that's the per-call-site
+// budgets' job, where the pcsx2/ layer can request a VM shutdown.
+namespace Log
+{
+	static constexpr u64 MAX_LOG_MESSAGES = 200000;
+	static std::atomic<u64> s_total_message_count{0};
+} // namespace Log
+
 void Log::ExecuteCallbacks(LOGLEVEL level, ConsoleColors color, std::string_view message)
 {
 	// TODO: Cache the message time.
+
+	if (const u64 count = s_total_message_count.fetch_add(1, std::memory_order_relaxed) + 1; count > MAX_LOG_MESSAGES) [[unlikely]]
+	{
+		if (count == MAX_LOG_MESSAGES + 1)
+		{
+			static constexpr std::string_view ceiling_message =
+				"Log message ceiling reached (200000) -- suppressing further log output for this session "
+				"to avoid runaway log/console growth. This usually means something is stuck in a tight loop.";
+			if (LOGLEVEL_ERROR <= s_console_level)
+				WriteToConsole(LOGLEVEL_ERROR, Color_StrongRed, ceiling_message);
+			if (LOGLEVEL_ERROR <= s_debug_level)
+				WriteToDebug(LOGLEVEL_ERROR, Color_StrongRed, ceiling_message);
+			if (LOGLEVEL_ERROR <= s_file_level)
+				WriteToFile(LOGLEVEL_ERROR, Color_StrongRed, ceiling_message);
+			if (LOGLEVEL_ERROR <= s_host_level)
+			{
+				const HostCallbackType callback = s_host_callback;
+				if (callback)
+					callback(LOGLEVEL_ERROR, Color_StrongRed, ceiling_message);
+			}
+		}
+		return;
+	}
 
 	// Split newlines into separate messages.
 	std::string_view::size_type start_pos = 0;

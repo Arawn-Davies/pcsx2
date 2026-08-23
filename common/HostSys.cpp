@@ -158,9 +158,19 @@ void AbortWithMessage(const char* msg)
 // that requires the CPU thread to reach a cooperative stop check it never
 // reaches -- needed a real force-quit to recover). This function is
 // deliberately independent of Qt, the emu thread, and VMManager entirely.
+//
+// A direct, blocking native call on the calling thread -- deliberately not
+// Host::ReportErrorAsync/QMetaObject::invokeMethod, which queue onto the Qt
+// GUI thread and were confirmed 2026-08-22 to never be serviced when called
+// from an interpreter thread stuck re-executing the same instruction forever
+// (nothing left to pump the GUI event loop with, and no cooperative stop
+// check for it to reach either).
 void AlertUserAndExit(const char* title, const std::string& msg)
 {
 #if defined(_WIN32)
+	// MB_OK only -- no Abort/Retry/Ignore choice like pxOnAssertFail's
+	// assertion dialog, since this path is for a condition already known
+	// unrecoverable.
 	MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONERROR);
 	// Matches pxOnAssertFail's non-Ignore branch: hard-terminate, no
 	// destructors, no dependency on any other thread or subsystem still
@@ -203,6 +213,18 @@ void AlertUserAndExit(const char* title, const std::string& msg)
 	fflush(stderr);
 	_exit(1);
 #endif
+}
+
+// kernelreloaded: origin/whiterhino's original single-argument call
+// convention (independently added 2026-08-22, same bug, see above),
+// preserved so its existing call sites don't need a title. Forwards to the
+// two-argument version with the exact title string its own Windows branch
+// used to hardcode into MessageBoxA, so behavior at those call sites is
+// unchanged on Windows and gains the macOS dialog (and TerminateProcess
+// hard-kill) it never had.
+void AlertUserAndExit(const char* msg)
+{
+	AlertUserAndExit("Fatal error", msg);
 }
 
 #ifndef __APPLE__
