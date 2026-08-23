@@ -414,6 +414,19 @@ extern void cpuSetNextEvent( u32 startCycle, s32 delta );
 // parser; checked every instruction from Interpreter.cpp's execI().
 extern void kernelreloadedSetBreakpoints(const char* addrListCsv);
 extern void kernelreloadedCheckBreakpoint(u32 pc);
+
+// kernelreloaded: bounded instruction-fetch trace over an address range,
+// armed by -kload-trace-range "start,end[,maxHits]" (hex start/end, decimal
+// maxHits, default 300). Built 2026-08-23 to see what real retail BIOS ROM
+// code (0x80001000-ish and up, outside every address this project's own
+// source controls) actually does at runtime -- one line of disassembly per
+// instruction fetched inside [start,end), auto-disarming once maxHits is
+// reached so it can never turn into unbounded logging. This observes
+// WhiteRhino's own interpreter behavior executing the ROM, not the ROM's
+// own content -- no ROM bytes are dumped, no analysis of Sony's own code is
+// performed or stored, only the live PC trajectory through it.
+extern void kernelreloadedSetTraceRange(const char* spec);
+extern void kernelreloadedCheckTraceRange(u32 pc);
 extern void cpuSetNextEventDelta( s32 delta );
 extern int  cpuTestCycle( u32 startCycle, s32 delta );
 extern void cpuSetEvent();

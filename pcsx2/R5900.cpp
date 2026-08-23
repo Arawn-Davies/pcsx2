@@ -260,6 +260,11 @@ static u32 eeTlbMissPrev = 0;
 static u32 eeLastDump = 0;
 
 static void cpuStateDump(bool force, const char* label);
+// Forward declaration: real definition is further down this file (next to
+// cpuStateDump's own use of it), needed here too by
+// kernelreloadedCheckTraceRange() below, which is deliberately placed next
+// to kernelreloadedCheckBreakpoint() rather than down by cpuStateDump().
+static bool eeRead32(u32 va, u32* out);
 
 // kernelreloaded: on-demand breakpoint dumps, driven by -kload-break on the
 // CLI (QtHost.cpp). Deliberately separate from the stock CBreakPoints/
@@ -306,6 +311,107 @@ void kernelreloadedCheckBreakpoint(u32 pc)
 			return;
 		}
 	}
+}
+
+// kernelreloaded: -kload-trace-range implementation. See the declaration in
+// R5900.h for the full rationale. Deliberately one line per instruction
+// (disassembly only, not a full cpuStateDump()) -- a full register dump per
+// hit is what made -kload-break runs against a tight loop painfully slow
+// earlier in this same investigation (real time roughly quadrupled with
+// several breakpoints active simultaneously); a range trace is meant to
+// cover hundreds of instructions in sequence, where that cost would compound
+// hundreds of times over for comparatively little extra information (the
+// PC trajectory itself is the point, not the full GPR file at every step).
+static u32 s_kernelreloadedTraceStart = 0;
+static u32 s_kernelreloadedTraceEnd = 0;
+static int s_kernelreloadedTraceRemaining = 0;
+// kernelreloaded: trigger gate, added after the first real run of this
+// feature showed why it's needed -- a 60,000-instruction budget exhausted
+// by cycle 1.77s of a boot whose actual moment of interest was ~24s in.
+// The BIOS ROM's low-address range isn't reserved for the one call path
+// under investigation; it's the BIOS's own general-purpose library code
+// (printf-style formatting, string/memory helpers), hit constantly for
+// completely mundane reasons throughout boot. Tracing "every time PC is in
+// this range" from process start makes the budget mean "however many
+// instructions of unrelated BIOS busywork happen to run first" -- useless.
+// A trigger address makes the trace inert (parsed, armed, but logging
+// nothing and spending no budget) until that one specific PC is hit once,
+// then active for the next maxHits instructions in range. 0 means no
+// trigger -- active immediately, the original (now rarely useful) behavior.
+static u32 s_kernelreloadedTraceTrigger = 0;
+static bool s_kernelreloadedTraceTriggered = false;
+
+void kernelreloadedSetTraceRange(const char* spec)
+{
+	s_kernelreloadedTraceStart = 0;
+	s_kernelreloadedTraceEnd = 0;
+	s_kernelreloadedTraceRemaining = 0;
+	s_kernelreloadedTraceTrigger = 0;
+	s_kernelreloadedTraceTriggered = false;
+	if (!spec)
+		return;
+
+	std::string s(spec);
+	const size_t c1 = s.find(',');
+	if (c1 == std::string::npos)
+	{
+		Console.WriteLn("kernelreloaded: -kload-trace-range needs start,end[,maxHits[,triggerPC]]");
+		return;
+	}
+	const size_t c2 = s.find(',', c1 + 1);
+	const std::string startTok = s.substr(0, c1);
+	const std::string endTok = s.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1);
+
+	s_kernelreloadedTraceStart = static_cast<u32>(std::strtoul(startTok.c_str(), nullptr, 16));
+	s_kernelreloadedTraceEnd = static_cast<u32>(std::strtoul(endTok.c_str(), nullptr, 16));
+	s_kernelreloadedTraceRemaining = 300;
+	if (c2 != std::string::npos)
+	{
+		const size_t c3 = s.find(',', c2 + 1);
+		const std::string maxTok = s.substr(c2 + 1, c3 == std::string::npos ? std::string::npos : c3 - c2 - 1);
+		s_kernelreloadedTraceRemaining = std::atoi(maxTok.c_str());
+		if (c3 != std::string::npos)
+		{
+			const std::string triggerTok = s.substr(c3 + 1);
+			s_kernelreloadedTraceTrigger = static_cast<u32>(std::strtoul(triggerTok.c_str(), nullptr, 16));
+		}
+	}
+	// No trigger given means "active from the start" -- same as marking it
+	// already triggered.
+	s_kernelreloadedTraceTriggered = (s_kernelreloadedTraceTrigger == 0);
+
+	Console.WriteLn("kernelreloaded: trace range armed 0x%08x-0x%08x, %d instructions%s",
+		s_kernelreloadedTraceStart, s_kernelreloadedTraceEnd, s_kernelreloadedTraceRemaining,
+		s_kernelreloadedTraceTrigger ? StringUtil::StdStringFromFormat(
+			", gated on trigger 0x%08x", s_kernelreloadedTraceTrigger).c_str() : "");
+}
+
+void kernelreloadedCheckTraceRange(u32 pc)
+{
+	if (s_kernelreloadedTraceRemaining <= 0)
+		return;
+
+	if (!s_kernelreloadedTraceTriggered)
+	{
+		if (pc != s_kernelreloadedTraceTrigger)
+			return;
+		s_kernelreloadedTraceTriggered = true;
+		Console.WriteLn("  RANGE trigger 0x%08x hit -- trace active", pc);
+	}
+
+	if (pc < s_kernelreloadedTraceStart || pc >= s_kernelreloadedTraceEnd)
+		return;
+
+	u32 word;
+	std::string text;
+	if (eeRead32(pc, &word))
+		R5900::disR5900Fasm(text, word, pc, false);
+	else
+		text = "<unmapped>";
+
+	s_kernelreloadedTraceRemaining--;
+	Console.WriteLn("  RANGE %08x: %s%s", pc, text.c_str(),
+		s_kernelreloadedTraceRemaining == 0 ? " (trace range exhausted)" : "");
 }
 
 

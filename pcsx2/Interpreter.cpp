@@ -176,6 +176,10 @@ static void execI()
 	// EXTRA_DEBUG), so this works in the plain release build build.sh
 	// produces. No-op (one empty-vector check) unless -kload-break was passed.
 	kernelreloadedCheckBreakpoint(pc);
+	// kernelreloaded: -kload-trace-range bounded instruction-fetch trace.
+	// No-op (one comparison against a start/end both left at 0) unless
+	// -kload-trace-range was passed.
+	kernelreloadedCheckTraceRange(pc);
 
 	// We need to increase the pc before executing the memRead32. An exception could appears
 	// and it expects the PC counter to be pre-incremented

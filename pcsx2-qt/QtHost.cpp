@@ -2237,6 +2237,18 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 				kernelreloadedSetBreakpoints((++it)->toStdString().c_str());
 				continue;
 			}
+			// kernelreloaded: bounded instruction-fetch trace over an EE
+			// address range -- "0xSTART,0xEND[,maxHits]" (maxHits decimal,
+			// default 300). See kernelreloadedSetTraceRange() in R5900.cpp
+			// for the full rationale (built to see what real BIOS ROM code
+			// actually does at runtime once -kload-break traced a fault
+			// into it and no further, with no ROM disassembly involved --
+			// this only observes WhiteRhino's own live PC trajectory).
+			else if (CHECK_ARG_PARAM(QStringLiteral("-kload-trace-range")))
+			{
+				kernelreloadedSetTraceRange((++it)->toStdString().c_str());
+				continue;
+			}
 			// kernelreloaded: IOP-side counterpart to -kload-break above --
 			// same comma-separated hex address syntax, but against psxRegs.pc
 			// (R3000A.cpp's kernelreloadedCheckIopBreakpoint(), checked from
