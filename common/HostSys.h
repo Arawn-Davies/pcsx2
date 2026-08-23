@@ -189,6 +189,19 @@ extern u32 ShortSpin();
 extern const u32 SPIN_TIME_NS;
 /// Like C abort() but adds the given message to the crashlog
 [[noreturn]] void AbortWithMessage(const char* msg);
+/// kernelreloaded: synchronous, thread-independent "show one native alert,
+/// then unconditionally terminate the process" -- the same guarantee
+/// Assertions.cpp's Windows pxOnAssertFail branch already has via
+/// MessageBoxA()+TerminateProcess() (blocks the calling thread directly, no
+/// Qt event loop or other thread's cooperation required). For call sites
+/// that need to inform the user the VM is unrecoverable and then exit --
+/// NOT for recoverable/developer-only asserts, which should keep using
+/// pxOnAssertFail. Unlike Host::RequestVMShutdown(), this never depends on
+/// the (possibly wedged) CPU thread reaching a cooperative stop check, so it
+/// cannot hang the UI the way that path can when called from inside a crash
+/// loop. See kernelreloaded's netbsd-cache-fix-never-built memory note
+/// (2026-08-23) for the reproduction that motivated this.
+[[noreturn]] void AlertUserAndExit(const char* title, const std::string& msg);
 
 extern std::string GetOSVersionString();
 

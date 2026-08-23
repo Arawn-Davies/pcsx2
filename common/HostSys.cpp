@@ -5,8 +5,18 @@
 #include "Console.h"
 #include "VectorIntrin.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #ifndef __APPLE__
 #include "cpuinfo.h"
+#endif
+
+#if defined(_WIN32)
+#include "RedtapeWindows.h"
+#elif defined(__UNIX__) || defined(__APPLE__)
+#include <unistd.h>
 #endif
 
 static u32 PAUSE_TIME = 0;
@@ -138,6 +148,61 @@ void AbortWithMessage(const char* msg)
 	gCRAnnotations.backtrace = gCRAnnotations.message;
 #endif
 	abort();
+}
+
+// kernelreloaded: see the declaration in HostSys.h for why this exists --
+// the short version is Host::RequestVMShutdown() can hang forever when
+// called from a wedged/crash-looping CPU thread (confirmed 2026-08-23,
+// NEARNULL guard in R5900.cpp: the "are you sure?" Qt dialog appears and
+// responds to clicks, but nothing ever actually tears the VM down because
+// that requires the CPU thread to reach a cooperative stop check it never
+// reaches -- needed a real force-quit to recover). This function is
+// deliberately independent of Qt, the emu thread, and VMManager entirely.
+void AlertUserAndExit(const char* title, const std::string& msg)
+{
+#if defined(_WIN32)
+	MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONERROR);
+	// Matches pxOnAssertFail's non-Ignore branch: hard-terminate, no
+	// destructors, no dependency on any other thread or subsystem still
+	// being in a sane state to run atexit()/global-destructor cleanup.
+	TerminateProcess(GetCurrentProcess(), 0xBAADC0DE);
+#elif defined(__APPLE__)
+	// AppKit dialogs (NSAlert et al.) are only safe to drive from the main
+	// thread, and this is explicitly meant to be callable from the CPU
+	// thread (that's the whole point -- it's the thread most likely to be
+	// the one that's wedged). osascript's `display dialog` runs as a
+	// separate process, so it needs no access to this process's AppKit
+	// runtime or main-thread run loop at all; it blocks this calling
+	// thread until dismissed, same as MessageBoxA does on Windows.
+	std::string script = "display dialog \"";
+	for (char c : msg)
+	{
+		if (c == '"' || c == '\\')
+			script += '\\';
+		script += c;
+	}
+	script += "\" with title \"";
+	script += title;
+	script += "\" buttons {\"OK\"} default button \"OK\" with icon stop";
+
+	std::string cmd = "osascript -e ";
+	cmd += '\'';
+	cmd += script;
+	cmd += '\'';
+	std::system(cmd.c_str());
+
+	fputs(msg.c_str(), stderr);
+	fputs("\nExiting.\n", stderr);
+	fflush(stderr);
+	_exit(1);
+#else
+	fputs(title, stderr);
+	fputs(": ", stderr);
+	fputs(msg.c_str(), stderr);
+	fputs("\nExiting.\n", stderr);
+	fflush(stderr);
+	_exit(1);
+#endif
 }
 
 #ifndef __APPLE__

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 
+#include "common/HostSys.h"
 #include "common/StringUtil.h"
 #include "ps2/BiosTools.h"
 #include "R5900.h"
@@ -571,9 +572,18 @@ void cpuTlbMiss(u32 addr, u32 bd, u32 excode)
 			// silently; allow_confirm=true still lets the user decline and
 			// inspect it themselves.
 			Console.Error("  NEARNULL: further messages suppressed (faulting in a tight loop)");
-			Host::ReportErrorAsync("Guest CPU crash loop detected",
+			// kernelreloaded (2026-08-23): was Host::ReportErrorAsync() +
+			// Host::RequestVMShutdown(true, ...). Confirmed live that this
+			// hangs -- the Qt "are you sure?" dialog appears and responds to
+			// clicks, but nothing ever tears the VM down, because that needs
+			// this same CPU thread (the one stuck in the fault loop that got
+			// us here) to reach a cooperative stop check it will never reach.
+			// Needed a real force-quit to recover. AlertUserAndExit() is
+			// deliberately independent of Qt/VMManager/this thread's own
+			// future cooperation -- same guarantee Assertions.cpp's Windows
+			// MessageBoxA()+TerminateProcess() branch already has.
+			AlertUserAndExit("Guest CPU crash loop detected",
 				fmt::format("Faulting repeatedly on near-null address 0x{:08x} at pc 0x{:08x}.", addr, cpuRegs.pc));
-			Host::RequestVMShutdown(true, false, false);
 		}
 	}
 
@@ -1035,16 +1045,19 @@ void eeloadHook()
 			// expects to own, so letting the interpreter fall through and
 			// keep executing real EELOAD code on top of that runs on
 			// corrupted state -- observed in practice as an immediate
-			// near-null jump, spinning forever and hanging the UI (Windows
-			// marks it Not Responding once the log/Qt event queue backs up
-			// with it). Report the failure and ask to shut down instead of
-			// letting that happen; allow_confirm=true pops the same "Confirm
-			// Shutdown" dialog a manual stop does, so the user can decline
-			// and inspect the hung state if they want to, rather than either
-			// silently corrupting onward or being killed without asking.
+			// near-null jump, spinning forever and hanging the UI. Report the
+			// failure and exit rather than letting that happen.
+			//
+			// kernelreloaded (2026-08-23): was Host::ReportErrorAsync() +
+			// Host::RequestVMShutdown(true, ...), same as the NEARNULL guard
+			// above -- same confirmed hang, same fix. See that comment for
+			// the full reasoning; AlertUserAndExit() doesn't offer a
+			// "decline and inspect" choice the way the old allow_confirm=true
+			// shutdown dialog did, but that choice never actually worked here
+			// (the CPU thread it needs is the one already corrupted/wedged),
+			// so removing it costs nothing real.
 			Console.Error(fmt::format("PS2 Linux direct boot failed: {}", db_error));
-			Host::ReportErrorAsync("PS2 Linux direct boot failed", db_error);
-			Host::RequestVMShutdown(true, false, false);
+			AlertUserAndExit("PS2 Linux direct boot failed", db_error);
 			return;
 		}
 	}
