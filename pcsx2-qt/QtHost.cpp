@@ -19,6 +19,7 @@
 #include "pcsx2/BuildVersion.h"
 #include "pcsx2/CDVD/CDVD.h"
 #include "pcsx2/R5900.h"
+#include "pcsx2/R3000A.h"
 #include "pcsx2/Counters.h"
 #include "pcsx2/DebugTools/Debug.h"
 #include "pcsx2/GS.h"
@@ -2234,6 +2235,18 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 			else if (CHECK_ARG_PARAM(QStringLiteral("-kload-break")))
 			{
 				kernelreloadedSetBreakpoints((++it)->toStdString().c_str());
+				continue;
+			}
+			// kernelreloaded: IOP-side counterpart to -kload-break above --
+			// same comma-separated hex address syntax, but against psxRegs.pc
+			// (R3000A.cpp's kernelreloadedCheckIopBreakpoint(), checked from
+			// R3000AInterpreter.cpp's execI()) rather than the EE's cpuRegs.pc.
+			// Necessary because the EE and IOP are separate CPUs with separate
+			// interpreters and separate address spaces -- an EE breakpoint has
+			// no way to ever see IOP code, or vice versa.
+			else if (CHECK_ARG_PARAM(QStringLiteral("-kload-iop-break")))
+			{
+				kernelreloadedSetIopBreakpoints((++it)->toStdString().c_str());
 				continue;
 			}
 			else if (CHECK_ARG(QStringLiteral("-fastboot")))

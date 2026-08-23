@@ -177,6 +177,14 @@ extern _sif sif0, sif1, sif2;
 
 extern void sifReset();
 
+// kernelreloaded: unconditional (budget-gated, not build-flag-gated) SIF0/
+// SIF1 transfer tracing -- see Sif.cpp for why this exists alongside the
+// stock SIF_LOG macro rather than just turning SIF_LOG on. "channel" is a
+// short fixed label ("SIF0" / "SIF1"); "desc" is typically the same
+// DMACh::cmqt_to_str() summary SIF_LOG already uses elsewhere in this file.
+extern int kernelreloadedSifTraceBudget;
+extern void kernelreloadedSifTrace(const char* channel, const std::string& desc);
+
 extern void SIF0Dma();
 extern void SIF1Dma();
 extern void SIF2Dma();

@@ -4,6 +4,13 @@
 #include "R3000A.h"
 #include "Common.h"
 
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "common/StringUtil.h"
+#include "DebugTools/Debug.h"
+
 #include "SIO/Sio0.h"
 #include "Sif.h"
 #include "DebugTools/Breakpoints.h"
@@ -12,6 +19,7 @@
 #include "IopBios.h"
 #include "IopHw.h"
 #include "IopDma.h"
+#include "IopMem.h"
 #include "CDVD/Ps1CD.h"
 #include "CDVD/CDVD.h"
 
@@ -57,10 +65,129 @@ void psxShutdown() {
 	//psxCpu->Shutdown();
 }
 
+// kernelreloaded: IOP-side breakpoint mechanism, direct counterpart to
+// R5900.cpp's own kernelreloadedSetBreakpoints/kernelreloadedCheckBreakpoint/
+// cpuStateDump. Built 2026-08-23 chasing a NetBSD boot hang whose EE-side
+// trail dead-ended at a jalr through a BIOS-provided function pointer that
+// resolved to a plausible, correctly-set address (0x80001020, inside the
+// real retail BIOS ROM's own reserved region) -- meaning the fault was no
+// longer in any code this project's own source controls, and the next real
+// question (does the IOP ever answer whatever SIF-RPC request the EE-side
+// BIOS is making) has no answer without IOP-side visibility, which nothing
+// in this codebase provided. See netbsd's porting-notes.md for the full
+// investigation this was built to continue.
+static std::vector<u32> s_kernelreloadedIopBreakpoints;
+
+void kernelreloadedSetIopBreakpoints(const char* addrListCsv)
+{
+	s_kernelreloadedIopBreakpoints.clear();
+	if (!addrListCsv)
+		return;
+
+	std::string list(addrListCsv);
+	size_t pos = 0;
+	while (pos < list.size())
+	{
+		const size_t comma = list.find(',', pos);
+		const std::string tok = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+		if (!tok.empty())
+		{
+			const u32 addr = static_cast<u32>(std::strtoul(tok.c_str(), nullptr, 16));
+			s_kernelreloadedIopBreakpoints.push_back(addr);
+			Console.WriteLn("kernelreloaded: IOP breakpoint armed at 0x%08x", addr);
+		}
+		if (comma == std::string::npos)
+			break;
+		pos = comma + 1;
+	}
+}
+
+// Mirrors R5900.cpp's cpuStateDump(), scaled to what the IOP actually has:
+// no TLB (the R3000A is unmapped -- kuseg/kseg0/kseg1 only, no MMU), so no
+// TLB entry table at the end. GPR names, COP0 layout (Status/Cause/EPC/
+// BadVAddr), and the "disassemble a few instructions at pc" idea all carry
+// over directly from the EE version.
+static void psxStateDump(const char* label)
+{
+	const u32 pc = psxRegs.pc;
+
+	Console.WriteLn("======== IOP %s @ cycle %u ========", label, psxRegs.cycle);
+	Console.WriteLn("pc   =%08x   sp=%08x   ra=%08x",
+		pc, psxRegs.GPR.n.sp, psxRegs.GPR.n.ra);
+
+	for (int i = 0; i < 6; i++)
+	{
+		const u32 addr = pc + i * 4;
+		const u32 word = iopMemRead32(addr);
+		Console.WriteLn("  %08x: %08x  %s", addr, word, disR3000AF(word, addr));
+	}
+
+	Console.WriteLn("sr   =%08x  cause=%08x  epc=%08x  badv=%08x",
+		psxRegs.CP0.n.Status, psxRegs.CP0.n.Cause, psxRegs.CP0.n.EPC, psxRegs.CP0.n.BadVAddr);
+
+	Console.WriteLn("  zero=%08x at  =%08x v0  =%08x v1  =%08x",
+		psxRegs.GPR.n.r0, psxRegs.GPR.n.at, psxRegs.GPR.n.v0, psxRegs.GPR.n.v1);
+	Console.WriteLn("  a0  =%08x a1  =%08x a2  =%08x a3  =%08x",
+		psxRegs.GPR.n.a0, psxRegs.GPR.n.a1, psxRegs.GPR.n.a2, psxRegs.GPR.n.a3);
+	Console.WriteLn("  t0  =%08x t1  =%08x t2  =%08x t3  =%08x",
+		psxRegs.GPR.n.t0, psxRegs.GPR.n.t1, psxRegs.GPR.n.t2, psxRegs.GPR.n.t3);
+	Console.WriteLn("  t4  =%08x t5  =%08x t6  =%08x t7  =%08x",
+		psxRegs.GPR.n.t4, psxRegs.GPR.n.t5, psxRegs.GPR.n.t6, psxRegs.GPR.n.t7);
+	Console.WriteLn("  s0  =%08x s1  =%08x s2  =%08x s3  =%08x",
+		psxRegs.GPR.n.s0, psxRegs.GPR.n.s1, psxRegs.GPR.n.s2, psxRegs.GPR.n.s3);
+	Console.WriteLn("  s4  =%08x s5  =%08x s6  =%08x s7  =%08x",
+		psxRegs.GPR.n.s4, psxRegs.GPR.n.s5, psxRegs.GPR.n.s6, psxRegs.GPR.n.s7);
+	Console.WriteLn("  t8  =%08x t9  =%08x k0  =%08x k1  =%08x",
+		psxRegs.GPR.n.t8, psxRegs.GPR.n.t9, psxRegs.GPR.n.k0, psxRegs.GPR.n.k1);
+	Console.WriteLn("  gp  =%08x sp  =%08x s8  =%08x ra  =%08x  hi=%08x lo=%08x",
+		psxRegs.GPR.n.gp, psxRegs.GPR.n.sp, psxRegs.GPR.n.s8, psxRegs.GPR.n.ra,
+		psxRegs.GPR.n.hi, psxRegs.GPR.n.lo);
+
+	std::string line;
+	for (int i = 0; i < 8; i++)
+		line += StringUtil::StdStringFromFormat("%08x ", iopMemRead32(psxRegs.GPR.n.sp + i * 4));
+	Console.WriteLn("stack@sp: %s", line.c_str());
+}
+
+void kernelreloadedCheckIopBreakpoint(u32 pc)
+{
+	if (s_kernelreloadedIopBreakpoints.empty())
+		return;
+	for (const u32 addr : s_kernelreloadedIopBreakpoints)
+	{
+		if (addr == pc)
+		{
+			psxStateDump("BREAKPOINT");
+			return;
+		}
+	}
+}
+
+// Bounded the same way eeExcBudget is in R5900.cpp: every exception is the
+// normal path for some IOP code (syscalls in particular fire constantly),
+// so this needs a ceiling or it drowns everything else, but a real IOP-side
+// fault -- the RPC-call hang this was built for could plausibly be one --
+// should still show up with a real trail instead of silently vanishing into
+// budget exhaustion with no marker that it happened at all.
+static int psxExcBudget = 300;
+
 void psxException(u32 code, u32 bd)
 {
 //	PSXCPU_LOG("psxException %x: %x, %x", code, psxHu32(0x1070), psxHu32(0x1074));
 	//Console.WriteLn("!! psxException %x: %x, %x", code, psxHu32(0x1070), psxHu32(0x1074));
+	if (psxExcBudget > 0)
+	{
+		psxExcBudget--;
+		const u32 excode = (code >> 2) & 0x1f;
+		// 8 = syscall, the IOP kernel's own normal path -- excluded the same
+		// way R5900.cpp's cpuException() excludes TLB refill/syscall, or this
+		// budget burns out in the first few dozen cycles of any real boot.
+		if (excode != 8)
+		{
+			Console.WriteLn("  IOP EXC %u pc=%08x cause=%08x sr=%08x%s",
+				excode, psxRegs.pc, code, psxRegs.CP0.n.Status, psxExcBudget == 0 ? " (further IOP EXC suppressed)" : "");
+		}
+	}
 	// Set the Cause
 	psxRegs.CP0.n.Cause &= ~0x7f;
 	psxRegs.CP0.n.Cause |= code;

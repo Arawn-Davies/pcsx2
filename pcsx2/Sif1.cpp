@@ -319,6 +319,7 @@ __fi void  EEsif1Interrupt()
 __fi void dmaSIF1()
 {
 	SIF_LOG("dmaSIF1 %s", sif1ch.cmqt_to_str().c_str());
+	kernelreloadedSifTrace("SIF1", sif1ch.cmqt_to_str());
 
 	if (sif1.fifo.readPos != sif1.fifo.writePos)
 	{

@@ -197,6 +197,17 @@ extern void psxReset();
 extern void psxException(u32 code, u32 step);
 extern void iopEventTest();
 
+// kernelreloaded: IOP-side counterpart to R5900.h's kernelreloadedSetBreakpoints/
+// kernelreloadedCheckBreakpoint -- same CSV-of-hex-addresses design, same
+// unconditional per-instruction check (cheap: one size()==0 test when unused),
+// same "dump everything, no pause" behavior. Armed by -kload-iop-break on the
+// CLI (QtHost.cpp), checked from R3000AInterpreter.cpp's execI(). Necessary
+// because the EE-side tool has no visibility at all into the IOP: the EE and
+// IOP are separate CPUs with separate address spaces and separate interpreters,
+// and an EE breakpoint can never fire on IOP code or vice versa.
+extern void kernelreloadedSetIopBreakpoints(const char* addrListCsv);
+extern void kernelreloadedCheckIopBreakpoint(u32 pc);
+
 int psxIsBreakpointNeeded(u32 addr);
 int psxIsMemcheckNeeded(u32 pc);
 

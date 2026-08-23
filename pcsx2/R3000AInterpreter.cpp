@@ -204,6 +204,16 @@ void psxCheckMemcheck()
 static __fi void execI()
 {
 	// This function is called for every instruction.
+
+	// kernelreloaded: IOP counterpart to R5900's execI() calling
+	// kernelreloadedCheckBreakpoint() unconditionally, right where the EE
+	// captures its own pc. Deliberately outside the EXTRA_DEBUG/PCSX2_DEVBUILD
+	// gate below, same reasoning as the EE side: this needs to work in the
+	// exact release build build.sh produces, not just dev builds. Cost when
+	// unused (the common case -- empty unless -kload-iop-break was passed) is
+	// one size()==0 check per instruction.
+	kernelreloadedCheckIopBreakpoint(psxRegs.pc);
+
 	// Enabling the define below will probably, no, will cause the interpretor to be slower.
 //#define EXTRA_DEBUG
 #if defined(EXTRA_DEBUG) || defined(PCSX2_DEVBUILD)
